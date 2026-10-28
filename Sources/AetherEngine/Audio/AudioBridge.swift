@@ -175,6 +175,11 @@ final class AudioBridge: @unchecked Sendable {
     private var swrInRate: Int32 = 0
     private var swrReconfigureFailures = 0
     private var swrInLayout = AVChannelLayout()
+    /// Pear fork: the host's mix (`AetherEngine.audioMix`) when it applies to this source. swr then writes
+    /// interleaved float, the stage adds gain and the limiter, and the samples are converted to `pcmSampleFmt`
+    /// on their way into the FIFO.
+    private var mixStage: AudioMixStage?
+    private var swrOutFmt: AVSampleFormat { mixStage == nil ? pcmSampleFmt : AV_SAMPLE_FMT_FLT }
     /// FIFO buffering resampled PCM until >= encoderCtx.frame_size samples. FLAC's wrapper has
     /// AV_CODEC_CAP_SMALL_LAST_FRAME but not VARIABLE_FRAME_SIZE, so non-final frames must hit frame_size exactly
     /// (~4608 @48kHz); EAC3 decodes 1536 samples/packet, so without the FIFO we'd hit -22 EINVAL on the first send.
@@ -350,8 +355,26 @@ final class AudioBridge: @unchecked Sendable {
         // `.surroundCompat`, FLAC VBR max 8 otherwise. bit_rate is set below once the channel count is capped
         // (EAC3 scales 128 kbps x nChannels per DrHurt on AetherEngine#4: 256 stereo, 768 5.1, and scales
         // further if the cap is bumped per Nomis101's PR 21668). FLAC = 0 (VBR).
+        // Pear fork: a host mix that folds this source to stereo makes it a stereo bridge (FLAC, lossless).
+        var mixLayout = AVChannelLayout()
+        if srcCodecpar.pointee.ch_layout.nb_channels > 0 && srcCodecpar.pointee.ch_layout.order != AV_CHANNEL_ORDER_UNSPEC {
+            av_channel_layout_copy(&mixLayout, &srcCodecpar.pointee.ch_layout)
+        } else if dec.pointee.ch_layout.nb_channels > 0 && dec.pointee.ch_layout.order != AV_CHANNEL_ORDER_UNSPEC {
+            av_channel_layout_copy(&mixLayout, &dec.pointee.ch_layout)
+        } else {
+            av_channel_layout_default(&mixLayout, resolvedChannels)
+        }
+        defer { av_channel_layout_uninit(&mixLayout) }
+        var foldsToStereo = false
+        if let request = AetherEngine.audioMix {
+            let stage = AudioMixStage(request: request)
+            if stage.plan(for: &mixLayout) != nil {
+                mixStage = stage
+                foldsToStereo = stage.folds(&mixLayout)
+            }
+        }
         let encoderCodecID = forcedEncoder
-            ?? Self.bridgeEncoder(for: mode, sourceChannels: resolvedChannels)
+            ?? Self.bridgeEncoder(for: mode, sourceChannels: foldsToStereo ? 2 : resolvedChannels)
         outputCodecID = encoderCodecID
         if encoderCodecID == AV_CODEC_ID_EAC3 {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
@@ -386,7 +409,7 @@ final class AudioBridge: @unchecked Sendable {
 
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
-        let nChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        let nChannels: Int32 = foldsToStereo ? 2 : min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -399,7 +422,8 @@ final class AudioBridge: @unchecked Sendable {
             + " "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
-            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
+            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))"
+            + (mixStage != nil ? " hostMix=\(foldsToStereo ? "fold-to-stereo" : "scale")" : ""),
             category: .session
         )
 
@@ -461,7 +485,7 @@ final class AudioBridge: @unchecked Sendable {
         let swrRet = swr_alloc_set_opts2(
             &swrCtx,
             &enc.pointee.ch_layout,
-            pcmSampleFmt,
+            swrOutFmt,
             sampleRate,
             &inLayout,
             inFmt,
@@ -473,6 +497,7 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.resamplerAllocFailed(code: swrRet)
         }
+        mixStage?.configure(swr: swrCtx, input: &inLayout, output: &enc.pointee.ch_layout, sampleRate: sampleRate)
         let initRet = swr_init(swrCtx)
         guard initRet >= 0 else {
             cleanup()
@@ -702,6 +727,7 @@ final class AudioBridge: @unchecked Sendable {
         if let dec = decoderCtx {
             avcodec_flush_buffers(dec)
         }
+        mixStage?.reset()
         if let swr = swrCtx {
             _ = swr_init(swr)
         }
@@ -1039,7 +1065,7 @@ final class AudioBridge: @unchecked Sendable {
         let setRet = swr_alloc_set_opts2(
             &scratch,
             &enc.pointee.ch_layout,
-            pcmSampleFmt,
+            swrOutFmt,
             enc.pointee.sample_rate,
             &sf.pointee.ch_layout,
             frameFmt,
@@ -1047,6 +1073,10 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
+        if setRet >= 0, scratch != nil {
+            mixStage?.configure(swr: scratch, input: &sf.pointee.ch_layout, output: &enc.pointee.ch_layout,
+                                sampleRate: enc.pointee.sample_rate)
+        }
         let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
         guard initRet >= 0 else {
             swr_free(&scratch)
@@ -1121,6 +1151,11 @@ final class AudioBridge: @unchecked Sendable {
             return
         }
 
+        if let mixStage {
+            try resampleMixedIntoFIFO(srcFrame: sf, enc: enc, swr: swr, fifo: fifo, stage: mixStage, outNbSamples: outNbSamples)
+            return
+        }
+
         let nChannels = enc.pointee.ch_layout.nb_channels
         let isPlanar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
         let bufferCount = isPlanar ? Int(nChannels) : 1
@@ -1162,6 +1197,68 @@ final class AudioBridge: @unchecked Sendable {
                 to: UnsafeMutableRawPointer?.self, capacity: bufferCount
             ) { rebound in
                 av_audio_fifo_write(fifo, rebound, producedSamples)
+            }
+        }
+        if written > 0 {
+            stats.samplesEnqueued += Int64(written)
+            stats.packetsFedSinceLastEnqueue = 0
+        }
+    }
+
+    /// Pear fork: swr wrote interleaved float with the host's matrix; gain and the limiter run on it, then it is
+    /// converted to the encoder's PCM format (S16, S32 at 24 bits, or planar float) for the FIFO.
+    private func resampleMixedIntoFIFO(
+        srcFrame sf: UnsafeMutablePointer<AVFrame>,
+        enc: UnsafeMutablePointer<AVCodecContext>,
+        swr: OpaquePointer,
+        fifo: OpaquePointer,
+        stage: AudioMixStage,
+        outNbSamples: Int32
+    ) throws {
+        let channels = Int(enc.pointee.ch_layout.nb_channels)
+        let floats = UnsafeMutablePointer<Float>.allocate(capacity: Int(outNbSamples) * channels)
+        defer { floats.deallocate() }
+        var outPtr: UnsafeMutablePointer<UInt8>? = UnsafeMutableRawPointer(floats).assumingMemoryBound(to: UInt8.self)
+        let produced = withUnsafeMutablePointer(to: &outPtr) { outBuf in
+            withUnsafeMutablePointer(to: &sf.pointee.extended_data) { srcPtr in
+                let srcReadOnly = UnsafeRawPointer(srcPtr.pointee).assumingMemoryBound(to: UnsafePointer<UInt8>?.self)
+                return swr_convert(swr, outBuf, outNbSamples, srcReadOnly, sf.pointee.nb_samples)
+            }
+        }
+        guard produced > 0 else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
+        let frames = Int(produced)
+        stage.process(floats, frames: frames, channels: channels)
+
+        let planar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
+        let bufferCount = planar ? channels : 1
+        let bytesPerBuffer = planar ? frames * Int(pcmBytesPerSample) : frames * channels * Int(pcmBytesPerSample)
+        let buffers: [UnsafeMutablePointer<UInt8>] = (0..<bufferCount).map { _ in .allocate(capacity: bytesPerBuffer) }
+        defer { for b in buffers { b.deallocate() } }
+        let total = frames * channels
+        switch pcmSampleFmt {
+        case AV_SAMPLE_FMT_S16:
+            let out = UnsafeMutableRawPointer(buffers[0]).assumingMemoryBound(to: Int16.self)
+            for i in 0..<total { out[i] = Int16(max(-32768, min(32767, (floats[i] * 32767).rounded()))) }
+        case AV_SAMPLE_FMT_S32:
+            // bits_per_raw_sample 24: the top 24 bits carry the sample.
+            let out = UnsafeMutableRawPointer(buffers[0]).assumingMemoryBound(to: Int32.self)
+            for i in 0..<total {
+                let v = Double(max(-1, min(1, floats[i]))) * 8_388_607
+                out[i] = Int32(v.rounded()) << 8
+            }
+        default:   // AV_SAMPLE_FMT_FLTP
+            for c in 0..<channels {
+                let out = UnsafeMutableRawPointer(buffers[c]).assumingMemoryBound(to: Float.self)
+                for f in 0..<frames { out[f] = floats[f * channels + c] }
+            }
+        }
+        var ptrs: [UnsafeMutablePointer<UInt8>?] = buffers.map { $0 }
+        let written = ptrs.withUnsafeMutableBufferPointer { buf in
+            buf.baseAddress!.withMemoryRebound(to: UnsafeMutableRawPointer?.self, capacity: bufferCount) { rebound in
+                av_audio_fifo_write(fifo, rebound, produced)
             }
         }
         if written > 0 {

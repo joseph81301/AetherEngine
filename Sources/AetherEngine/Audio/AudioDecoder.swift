@@ -19,6 +19,8 @@ final class AudioDecoder: @unchecked Sendable {
     /// Mirrors SoftwareVideoDecoder's lock discipline.
     private let stateLock = NSLock()
     private var swrContext: OpaquePointer?
+    /// Pear fork: the host's mix (`AetherEngine.audioMix`), when it applies to the current input.
+    private var mixStage: AudioMixStage?
     private var audioFormatDescription: CMAudioFormatDescription?
 
     /// Source stream time base for PTS conversion.
@@ -146,6 +148,15 @@ final class AudioDecoder: @unchecked Sendable {
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
         if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
+        // Pear fork: a host mix that folds this source plays it as stereo.
+        mixStage = nil
+        if let request = AetherEngine.audioMix, frameChannels > 0 {
+            let stage = AudioMixStage(request: request)
+            if stage.plan(for: &frame.pointee.ch_layout) != nil {
+                mixStage = stage
+                if stage.folds(&frame.pointee.ch_layout) { channels = 2 }
+            }
+        }
 
         var outLayout = AVChannelLayout()
         // #401: this is the order the stamped layout has to name, so both come from one place.
@@ -180,6 +191,7 @@ final class AudioDecoder: @unchecked Sendable {
             nil
         )
         guard ret >= 0, swrContext != nil else { return false }
+        mixStage?.configure(swr: swrContext, input: &inLayout, output: &outLayout, sampleRate: sampleRate)
         guard swr_init(swrContext) >= 0 else {
             swr_free(&swrContext)
             return false
@@ -207,6 +219,7 @@ final class AudioDecoder: @unchecked Sendable {
         defer { stateLock.unlock() }
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
+        mixStage?.reset()
         // Drop the coalesced samples; after a seek they'd be at the wrong PTS anyway.
         resetPending()
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
@@ -352,6 +365,8 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
+        mixStage?.process(UnsafeMutableRawPointer(tempBuffer).assumingMemoryBound(to: Float.self),
+                          frames: Int(convertedSamples), channels: Int(channels))
 
         // First frame in a new accumulator captures the PTS; subsequent frames only extend the buffer.
         if pendingSampleCount == 0 {

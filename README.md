@@ -1,4 +1,7 @@
 <p align="center">
+
+> **Pear fork.** This copy adds a host audio mix (`AetherEngine.audioMix`, `Sources/AetherEngine/Audio/Mix/AudioMix.swift`): Infuse-style downmix levels, dialogue and volume boost with a limiter, applied where the engine decodes audio. Branch `pear`, based on 7.40.1. Same licence (LGPL v3 with the App Store exception); upstream: https://github.com/superuser404notfound/AetherEngine
+
   <img src=".github/aetherengine-logo.png" alt="AetherEngine" width="180">
 </p>
 
