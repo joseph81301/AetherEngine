@@ -6,7 +6,7 @@ import AetherLibswresample
 /// Pear fork: the host audio mix (`AetherEngine.audioMix`, `AudioMixStage`).
 final class HostAudioMixTests: XCTestCase {
 
-    private func fold(_ labels: [String]) -> AudioMixRequest.Plan? {
+    private static func fold(_ labels: [String]) -> AudioMixRequest.Plan? {
         guard labels.count > 2 else { return nil }
         let rows = ["L", "R"].map { side in
             labels.map { l -> Double in
@@ -25,11 +25,11 @@ final class HostAudioMixTests: XCTestCase {
         var layout = AVChannelLayout()
         av_channel_layout_default(&layout, 6)
         defer { av_channel_layout_uninit(&layout) }
-        XCTAssertEqual(AudioMixStage.labels(&layout), ["FL", "FR", "FC", "LFE", "SL", "SR"])
+        XCTAssertEqual(AudioMixStage.labels(&layout), ["FL", "FR", "FC", "LFE", "BL", "BR"])
     }
 
     func testFoldsSurroundButNotStereo() {
-        let stage = AudioMixStage(request: AudioMixRequest(plan: { self.fold($0) }))
+        let stage = AudioMixStage(request: AudioMixRequest(plan: { Self.fold($0) }))
         var surround = AVChannelLayout(), stereo = AVChannelLayout()
         av_channel_layout_default(&surround, 6)
         av_channel_layout_default(&stereo, 2)
@@ -40,7 +40,7 @@ final class HostAudioMixTests: XCTestCase {
     }
 
     func testMatrixIsAcceptedBySwr() {
-        let stage = AudioMixStage(request: AudioMixRequest(plan: { self.fold($0) }))
+        let stage = AudioMixStage(request: AudioMixRequest(plan: { Self.fold($0) }))
         var inLayout = AVChannelLayout(), outLayout = AVChannelLayout()
         av_channel_layout_default(&inLayout, 6)
         av_channel_layout_default(&outLayout, 2)

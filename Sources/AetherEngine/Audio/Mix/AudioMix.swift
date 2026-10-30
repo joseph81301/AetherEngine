@@ -133,7 +133,8 @@ final class AudioMixStage {
             if peak * limiter > Self.ceiling {
                 limiter = Self.ceiling / peak
             } else {
-                limiter = min(1, limiter + (1 - limiter) * releasePerSample)
+                // Release towards 1, but never past what keeps this frame under the ceiling.
+                limiter = min(1, Self.ceiling / max(peak, .leastNonzeroMagnitude), limiter + (1 - limiter) * releasePerSample)
             }
             if limiter < 1 {
                 for c in 0..<channels { samples[base + c] *= limiter }
