@@ -7095,13 +7095,17 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// Playback URL and subtitle-rendition reality for a freshly started loopback session, after the AirPlay
-    /// rewrite (#86, #227). Identity outside iOS and whenever external playback is off; when the LAN IP scan
+    /// rewrite (#86, #227). Identity outside iOS and macOS and whenever external playback is off; when the LAN IP scan
     /// comes up empty the loopback URL stays as resolved (the receiver then simply cannot reach it, unchanged
     /// from #86). `subtitleRenditionsServed` is what the served playlist actually carries, which is what
     /// `nativeSubtitleRenditionsServed` promises hosts.
     func airPlayAdjustedPlayback(url: URL, session: HLSVideoEngine) -> (url: URL, subtitleRenditionsServed: Bool) {
         airPlayServedMasterToReceiver = false
-        #if os(iOS)
+        // macOS too: a Mac sends AVPlayer to an AirPlay receiver the same way (the route picker's video
+        // route), and the receiver can no more reach 127.0.0.1 than one fed by an iPhone. A Mac has no
+        // wired-HDMI ambiguity (an external display never flips external playback), so the KVO edge alone
+        // means a wireless receiver; there is no audio-session route to read the receiver's UID from.
+        #if os(iOS) || os(macOS)
         guard airPlayActive else { return (url, session.servingMasterPlaylist) }
         let receiverUID = Self.currentAirPlayReceiverUID()
         let refusedBefore = receiverUID.map { airPlayReceiversRefusingHDRMaster.contains($0) } ?? false

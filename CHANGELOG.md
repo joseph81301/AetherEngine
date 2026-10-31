@@ -10,7 +10,11 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **AirPlay video from a Mac reaches the receiver.** A Mac that sent a native-route session to an Apple
+  TV or an AirPlay TV handed the receiver the engine's 127.0.0.1 playlist, which it cannot reach, so the
+  TV never started. The LAN-address rewrite that iOS has done since #86 now applies on macOS too.
 
 ## [7.40.1] - 2026-10-18
 
