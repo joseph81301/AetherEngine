@@ -1,6 +1,7 @@
 import Foundation
 import AetherLibavutil
 import AetherLibswresample
+import AetherLibavcodec
 
 /// A host's own audio mix (Pear fork): how decoded channels are folded and how loud they play, applied where
 /// the engine decodes audio itself. Infuse-style "Original" downmix levels, centre (dialogue) boost, LFE in the
@@ -83,6 +84,19 @@ final class AudioMixStage {
     func folds(_ layout: UnsafePointer<AVChannelLayout>) -> Bool {
         guard let p = plan(for: layout) else { return false }
         return p.rows.count == 2 && layout.pointee.nb_channels > 2
+    }
+
+    /// Whether the loopback route decodes this source for the host's mix instead of stream-copying it. Dolby
+    /// Atmos (E-AC-3 JOC, profile 30) stays stream-copied unless the mix folds it to stereo: decoding it for a
+    /// surround output to apply a boost would turn Atmos into plain PCM and drop its heights, so the receiver
+    /// keeps Atmos and the boost does not apply (Infuse leaves passthrough alone the same way).
+    static func decodesOnLoopback(_ request: AudioMixRequest?, layout: UnsafePointer<AVChannelLayout>,
+                                  codecID: AVCodecID, profile: Int32) -> Bool {
+        guard let request else { return false }
+        let stage = AudioMixStage(request: request)
+        guard stage.plan(for: layout) != nil else { return false }
+        let atmos = codecID == AV_CODEC_ID_EAC3 && profile == 30
+        return !atmos || stage.folds(layout)
     }
 
     /// Sets the matrix on an allocated, not yet initialised swr context. Rows are remapped by label when the

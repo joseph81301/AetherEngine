@@ -1923,10 +1923,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // field claims, so a stream with small blocks cannot be copied, only decoded.
             let flacBlocksTooSmall = compat == .flac
                 && FLACStreamInfo.coreMediaRejectsStreamCopy(UnsafePointer(audioStream.pointee.codecpar))
-            // Pear fork: a host mix (`AetherEngine.audioMix`) for this source means decoding it here.
-            let hostMixApplies = AetherEngine.audioMix.map {
-                AudioMixStage(request: $0).plan(for: &audioStream.pointee.codecpar.pointee.ch_layout) != nil
-            } ?? false
+            // Pear fork: a host mix (`AetherEngine.audioMix`) for this source means decoding it here, except
+            // Atmos on a surround output, which keeps its heights (AudioMixStage.decodesOnLoopback).
+            let hostMixApplies = AudioMixStage.decodesOnLoopback(
+                AetherEngine.audioMix, layout: &audioStream.pointee.codecpar.pointee.ch_layout,
+                codecID: audioStream.pointee.codecpar.pointee.codec_id,
+                profile: audioStream.pointee.codecpar.pointee.profile)
             if flacBlocksTooSmall {
                 bridgePreferred = true
                 let sizes = FLACStreamInfo.blockSizes(UnsafePointer(audioStream.pointee.codecpar))

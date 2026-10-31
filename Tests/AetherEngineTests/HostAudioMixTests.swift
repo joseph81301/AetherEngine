@@ -1,6 +1,7 @@
 import XCTest
 import AetherLibavutil
 import AetherLibswresample
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// Pear fork: the host audio mix (`AetherEngine.audioMix`, `AudioMixStage`).
@@ -72,5 +73,21 @@ final class HostAudioMixTests: XCTestCase {
         fresh.configure(swr: swr, input: &inLayout, output: &inLayout, sampleRate: 48_000)
         quiet.withUnsafeMutableBufferPointer { fresh.process($0.baseAddress!, frames: 1, channels: 2) }
         XCTAssertEqual(quiet[0], 0.05 * Float(pow(10, 0.5)), accuracy: 0.001)
+    }
+
+    func testAtmosKeepsStreamCopyUnlessFoldedToStereo() {
+        var surround = AVChannelLayout()
+        av_channel_layout_default(&surround, 6)
+        defer { av_channel_layout_uninit(&surround) }
+        // A boost on a surround output keeps every channel: plain 5.1 is decoded for it, Atmos is not.
+        let scale = AudioMixRequest(plan: { labels in
+            .init(rows: labels.indices.map { i in labels.indices.map { $0 == i ? 1 : 0 } }, gainDb: 6)
+        })
+        XCTAssertTrue(AudioMixStage.decodesOnLoopback(scale, layout: &surround, codecID: AV_CODEC_ID_EAC3, profile: 0))
+        XCTAssertFalse(AudioMixStage.decodesOnLoopback(scale, layout: &surround, codecID: AV_CODEC_ID_EAC3, profile: 30))
+        // Folded for stereo speakers, Atmos is decoded like anything else.
+        let fold = AudioMixRequest(plan: { Self.fold($0) })
+        XCTAssertTrue(AudioMixStage.decodesOnLoopback(fold, layout: &surround, codecID: AV_CODEC_ID_EAC3, profile: 30))
+        XCTAssertFalse(AudioMixStage.decodesOnLoopback(nil, layout: &surround, codecID: AV_CODEC_ID_AC3, profile: 0))
     }
 }
