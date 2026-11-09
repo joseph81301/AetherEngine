@@ -21,6 +21,12 @@ extension HLSVideoEngine {
         /// that only share a container, and the routing log prints this name, so an operator reading
         /// `codec=nellymoser` learns what the file carries. None is fMP4-legal, so all three bridge.
         case nellymoser, adpcmSwf, speex
+        /// Every RealAudio an `.rm` / `.rmvb` carries (Cook, ATRAC3, Sipro, RealAudio Lossless and the
+        /// 14.4 / 28.8 speech codecs), which arrive with the RealMedia support of FFmpegBuild 3.8.0. One
+        /// family like `wma`: they share a container and nothing downstream tells them apart.
+        case realAudio
+        /// AMR narrowband and wideband, the speech audio of a feature phone's 3GP (FFmpegBuild 3.8.0).
+        case amr
         /// What this case costs is the STREAM-COPY decision, not the audio. Since the bridge cascade
         /// was rewired (2026-05-13) it asks libavcodec for a decoder by id and never consults this
         /// table, so a codec that lands here still plays if the build carries its decoder; measured
@@ -52,6 +58,14 @@ extension HLSVideoEngine {
             case AV_CODEC_ID_NELLYMOSER: return .nellymoser
             case AV_CODEC_ID_ADPCM_SWF:  return .adpcmSwf
             case AV_CODEC_ID_SPEEX:      return .speex
+            case AV_CODEC_ID_COOK,
+                 AV_CODEC_ID_ATRAC3,
+                 AV_CODEC_ID_SIPR,
+                 AV_CODEC_ID_RALF,
+                 AV_CODEC_ID_RA_144,
+                 AV_CODEC_ID_RA_288:
+                return .realAudio
+            case AV_CODEC_ID_AMR_NB, AV_CODEC_ID_AMR_WB: return .amr
             // G.711 A-law / mu-law sit here rather than in a case of their own: libavcodec spells
             // them pcm_alaw / pcm_mulaw, they decode to the same S16 the raw shapes do, and nothing
             // downstream of the bridge tells them apart. FLV is where they turn up.
@@ -62,7 +76,8 @@ extension HLSVideoEngine {
                  AV_CODEC_ID_PCM_S32LE,
                  AV_CODEC_ID_PCM_U8,
                  AV_CODEC_ID_PCM_ALAW,
-                 AV_CODEC_ID_PCM_MULAW:
+                 AV_CODEC_ID_PCM_MULAW,
+                 AV_CODEC_ID_PCM_DVD:
                 return .pcm
             default: return .unsupported
             }
@@ -77,7 +92,7 @@ extension HLSVideoEngine {
             case .flac:   return "fLaC"
             case .alac:   return "alac"
             case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
-                 .nellymoser, .adpcmSwf, .speex, .unsupported:
+                 .nellymoser, .adpcmSwf, .speex, .realAudio, .amr, .unsupported:
                 // mp3: theoretically mp4a.40.34, but AVPlayer treats any mp4a as AAC and fails; bridge to FLAC.
                 return ""
             }
@@ -87,7 +102,7 @@ extension HLSVideoEngine {
         var requiresBridge: Bool {
             switch self {
             case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
-                 .nellymoser, .adpcmSwf, .speex: return true
+                 .nellymoser, .adpcmSwf, .speex, .realAudio, .amr: return true
             default: return false
             }
         }
@@ -201,6 +216,16 @@ extension HLSVideoEngine {
             )
         }
         let forcedDrop = forcedForTesting || knownUndecodable
+        // AE#923: shaping needs PCM, so it takes the session past stream copy and object rendering.
+        let shapes = audioShaping.isActive
+        audioShapingApplied = false
+        if shapes, sourceAudioStream != nil {
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#923 audio shaping (\(audioShaping.summary)): decoding \(sourceIsAtmos ? "the EAC3+JOC Atmos track (objects not carried) " : "")"
+                + "through the PCM bridge instead of stream copy",
+                category: .session
+            )
+        }
 
         let sourceCodecLabel: String = {  // falls back to "audio" for codecs with no libavcodec name entry
             if let stream = sourceAudioStream,
@@ -210,7 +235,7 @@ extension HLSVideoEngine {
             return "audio"
         }()
 
-        if !forcedDrop, !preferBridge, let cfg = streamCopyAudio, let vcfg = savedVideoConfig {
+        if !forcedDrop, !preferBridge, !shapes, let cfg = streamCopyAudio, let vcfg = savedVideoConfig {
             // Pre-flight avformat_write_header: makeProducer is lazy (muxer alloc on first keep-packet), so a
             // failure there (EAC3-from-MKV, missing dec3 extradata, -22 "Cannot write moov atom before EAC3
             // packets parsed") would leave the producer stuck with the bridge fallback unreachable.
@@ -221,7 +246,8 @@ extension HLSVideoEngine {
                 doviConfig: vcfg.doviConfig,
                 colorOverride: vcfg.colorOverride,
                 extradataOverride: vcfg.extradataOverride,
-                convertsAnnexBSamples: vcfg.convertsAnnexBSamples
+                convertsAnnexBSamples: vcfg.convertsAnnexBSamples,
+                stereo: vcfg.stereo
             )
             let probeAudio = MP4SegmentMuxer.AudioConfig(
                 codecpar: cfg.codecpar,
@@ -273,7 +299,7 @@ extension HLSVideoEngine {
                     )
                 }
             }
-        } else if preferBridge && sourceIsAtmos {
+        } else if preferBridge && sourceIsAtmos && !shapes {
             // EAC3+JOC always stream-copies; a pre-bridge decision is a codec-table bug.
             EngineLog.emit(
                 "[HLSVideoEngine] WARNING: Atmos source pre-routed to FLAC bridge without stream-copy attempt, Atmos lost. Investigate the codec compatibility table.",
@@ -283,7 +309,7 @@ extension HLSVideoEngine {
 
         // #731: TrueHD Atmos or DTS:X with object rendering requested. Tried before the channel bridges,
         // which it falls back to on any failure (see buildSpatialAudioProducerIfEligible).
-        if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
+        if !forcedDrop, !shapes, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
            let prod = buildSpatialAudioProducerIfEligible(
                audioStream: audioStream,
                audioDemuxer: audioDemuxer,
@@ -301,9 +327,10 @@ extension HLSVideoEngine {
             // video-only after one attempt, try the other encoder. Only encoder-absence cascades (retrying
             // a different encoder can help); every other init failure is source-specific and re-attempting
             // is pointless, so it stops immediately.
+            let sourceChannels = audioStream.pointee.codecpar.pointee.ch_layout.nb_channels
             let firstAttempt = AudioBridge.bridgeEncoder(
                 for: audioBridgeMode,
-                sourceChannels: audioStream.pointee.codecpar.pointee.ch_layout.nb_channels)
+                sourceChannels: shapes ? audioShaping.outputChannels(forSource: sourceChannels) : sourceChannels)
             let cascade = Self.bridgeEncoderCascade(firstAttempt: firstAttempt)
             attempts: for (attemptIndex, encoderAttempt) in cascade.enumerated() {
                 let isLastAttempt = attemptIndex == cascade.count - 1
@@ -315,7 +342,8 @@ extension HLSVideoEngine {
                         mode: audioBridgeMode,
                         // The first attempt lets the bridge resolve, so a container that under-reports its
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
-                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt
+                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
+                        shaping: audioShaping
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
                     EngineLog.emit(
@@ -364,8 +392,9 @@ extension HLSVideoEngine {
                     let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
                     let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
                     audioHLSCodecs = hlsCodec
-                    self.audioPipelineDescription = pipelineLabel
+                    self.audioPipelineDescription = shapes ? pipelineLabel + " (shaped)" : pipelineLabel
                     self.audioDelivery = .bridged
+                    self.audioShapingApplied = shapes
                     if attemptIndex > 0 {
                         EngineLog.emit(
                             "[HLSVideoEngine] audio bridge cascaded \(Self.encoderLabel(firstAttempt)) → "

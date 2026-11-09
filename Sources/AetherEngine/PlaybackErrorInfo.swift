@@ -34,9 +34,23 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// nothing looked. Nothing about the media is wrong and no retry will help; the trust decision is
     /// the host's to make (AE#495).
     public static let sourceCertificateRejected = PlaybackErrorKind(rawValue: "sourceCertificateRejected")
+    /// The origin answered a byte range with bytes from somewhere else: a `206` whose `Content-Range`
+    /// names the requested offset over a body that does not hold the bytes the reader already had for
+    /// that offset (IPTV timeshift archives answer on their own chunk boundaries). Arrives at the open
+    /// or mid-session, wherever the reader first re-reads bytes it holds. Nothing this origin sends past
+    /// byte 0 can be placed, so no retry at an offset helps: load the source again with
+    /// `LoadOptions.sequentialOrigin` (and `declaredDurationSeconds`), and serve seeks outside the
+    /// resident range by re-requesting the source at the target, the way a timeshift URL addresses
+    /// time (AE#958). Before this kind the same session played repeated or shifted audio and video,
+    /// or failed as `vodSourceFailed` / `softwarePipelineFailed`.
+    public static let sourceFabricatesRanges = PlaybackErrorKind(rawValue: "sourceFabricatesRanges")
     /// A custom `IOReader`'s initial probe failed. The host built that reader, so only the host can
     /// re-point it.
     public static let customSourceProbeFailed = PlaybackErrorKind(rawValue: "customSourceProbeFailed")
+    /// The HLS ingest cannot handle the source's segment/encryption layout.
+    public static let hlsFormatUnsupported = PlaybackErrorKind(rawValue: "hlsFormatUnsupported")
+    /// An HLS ingest validation/decryption/stall failure; the stable underlying code identifies it.
+    public static let hlsIngestFailed = PlaybackErrorKind(rawValue: "hlsIngestFailed")
     /// A live probe that burned its full reconnect budget without opening.
     public static let liveSourceUnavailable = PlaybackErrorKind(rawValue: "liveSourceUnavailable")
     /// An HLS playlist handed to the raw live path by a custom reader, which the engine cannot re-point
@@ -111,17 +125,25 @@ public struct PlaybackErrorInfo: Sendable, Equatable {
     public let underlyingDomain: String?
     /// `NSError.code` of the failure underneath, or a reader's own code where one exists.
     public let underlyingCode: Int?
+    /// Finite HLS subreason; unlike the human-readable message, safe for support telemetry.
+    public let hlsDiagnosticReason: HLSIngestDiagnosticReason?
+    /// Original negative FFmpeg error, separate from the stable NSError case code.
+    public let ffmpegErrorCode: Int?
     /// The same text `state` carries.
     public let message: String
 
     public init(kind: PlaybackErrorKind,
                 message: String,
                 underlyingDomain: String? = nil,
-                underlyingCode: Int? = nil) {
+                underlyingCode: Int? = nil,
+                hlsDiagnosticReason: HLSIngestDiagnosticReason? = nil,
+                ffmpegErrorCode: Int? = nil) {
         self.kind = kind
         self.message = message
         self.underlyingDomain = underlyingDomain
         self.underlyingCode = underlyingCode
+        self.hlsDiagnosticReason = hlsDiagnosticReason
+        self.ffmpegErrorCode = ffmpegErrorCode
     }
 
     /// Captures domain and code off a Foundation / AVFoundation error, which is the half of the
@@ -131,7 +153,9 @@ public struct PlaybackErrorInfo: Sendable, Equatable {
         self.init(kind: kind,
                   message: message,
                   underlyingDomain: nsError?.domain,
-                  underlyingCode: nsError?.code)
+                  underlyingCode: nsError?.code,
+                  hlsDiagnosticReason: .preserved(in: underlying),
+                  ffmpegErrorCode: DemuxerError.preservedFFmpegCode(in: underlying))
     }
 }
 
@@ -143,8 +167,24 @@ extension AetherEngine {
     /// `state = .error(...)` appears anywhere else.
     @MainActor
     func publishError(_ info: PlaybackErrorInfo) {
+        let caught = !isCustomSource && loadedURL.map {
+            FabricatedRangeOrigins.caughtRecently($0, within: HLSVideoEngine.rateLimitVerdictWindowSeconds)
+        } == true
+        let info = Self.reclassifiedForFabricatedRanges(info, caught: caught)
         errorInfo = info
         state = .error(info.message)
+    }
+
+    /// AE#958: every route reports a reader that stopped reading in its own generic terms (the open,
+    /// the native producer, the software pipeline). When the reader stopped because the origin was
+    /// caught fabricating a range, that is what the host is told, since it calls for a different load.
+    nonisolated static func reclassifiedForFabricatedRanges(_ info: PlaybackErrorInfo,
+                                                           caught: Bool) -> PlaybackErrorInfo {
+        let generic: Set<PlaybackErrorKind> = [.sourceOpenFailed, .vodSourceFailed, .softwarePipelineFailed]
+        guard caught, generic.contains(info.kind) else { return info }
+        return PlaybackErrorInfo(kind: .sourceFabricatesRanges,
+                                 message: "Source origin answers byte ranges with other bytes; "
+                                    + "load it with sequentialOrigin")
     }
 
     /// Engine-authored failure: the sentence names the cause and stays in English.
@@ -165,9 +205,25 @@ extension AetherEngine {
     /// `sourceRateLimited`, not `sourceRefused` (#377): the source is not gone, the same request is
     /// expected to work later, and a host that reacts to a refusal by handing off to a second player
     /// would have that player metered by the same origin. Anything the reader did not type keeps the
-    /// historical `sourceOpenFailed` with whatever was underneath.
+    /// historical `sourceOpenFailed` with whatever was underneath. A failed live start keeps
+    /// `liveSourceUnavailable`; preserving its cause must not change the host's recovery contract.
+    /// `transportFailureCode` is the URL error the reader last recorded before the start gave up; it
+    /// names the cause of a live start the error itself (an FFmpeg open failure) cannot.
     @MainActor
-    func publishLoadFailure(_ error: Error) {
+    func publishLoadFailure(_ error: Error, isLiveStart: Bool = false, transportFailureCode: Int? = nil) {
+        if let ingest = error as? HLSIngestError {
+            switch ingest {
+            case .playlistUnreachable(let status) where status > 0:
+                publishLoadFailure(AVIOReaderError.httpStatus(status), isLiveStart: isLiveStart)
+            case _ where isLiveStart:
+                publishError(.liveSourceUnavailable, "Live source unavailable", underlying: ingest)
+            case .encryptedNotSupported, .unsupportedSegmentFormat, .demuxedAudioNotSupported:
+                publishError(.hlsFormatUnsupported, "HLS format unsupported", underlying: ingest)
+            default:
+                publishError(.hlsIngestFailed, "HLS ingest failed", underlying: ingest)
+            }
+            return
+        }
         // AE#495: trust first. A refused handshake is not a verdict on the resource, it is the absence
         // of a connection, and it can arrive either typed by the reader or as a URL error nested under
         // whatever gave up on top of it.
@@ -191,6 +247,15 @@ extension AetherEngine {
             publishError(PlaybackErrorInfo(kind: kind,
                                            message: "Failed to load: \(error.localizedDescription)",
                                            underlyingCode: status))
+            return
+        }
+        if isLiveStart {
+            if let code = SourceNetworkDiagnostics.urlErrorCode(error) ?? transportFailureCode {
+                publishError(PlaybackErrorInfo(kind: .liveSourceUnavailable, message: "Live source unavailable",
+                                               underlyingDomain: NSURLErrorDomain, underlyingCode: code))
+            } else {
+                publishError(.liveSourceUnavailable, "Live source unavailable", underlying: error)
+            }
             return
         }
         publishError(.sourceOpenFailed, "Failed to load: \(error.localizedDescription)", underlying: error)

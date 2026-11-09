@@ -114,13 +114,16 @@ final class OrderedDelivery: @unchecked Sendable {
     /// One-shot-per-stall latch so a run of consecutive missing tickets logs
     /// once for the event rather than once per skipped ticket.
     private var stallLogPending = false
+    /// Tickets the stall guard has given up on, over this instance's life. Confined to `queue`.
+    private var stallSkippedTickets: UInt64 = 0
 
     private let pendingCountLock = NSLock()
     private var pendingCount: Int = 0
     private var peakPendingCount: Int = 0
 
     private struct PendingEntry {
-        let frame: DeliveredFrame
+        /// Nil for a ticket that is given up on: it takes its place in line and emits nothing.
+        let frame: DeliveredFrame?
         let signpostID: OSSignpostID
     }
 
@@ -173,6 +176,25 @@ final class OrderedDelivery: @unchecked Sendable {
                 return
             }
             pending[ticket] = PendingEntry(frame: frame, signpostID: signpostID)
+            updatePendingCounts()
+            drainReady()
+        }
+    }
+
+    /// Gives up the frame holding `ticket`: it keeps its place in line, so the frames behind it are not held
+    /// up, but nothing is emitted for it. Used when a composition failed after it had started writing into
+    /// the buffer it would have delivered, which leaves nothing that is safe to show. Same epoch rules as
+    /// ``fulfil(ticket:epoch:_:)``.
+    func skip(ticket: UInt64, epoch callerEpoch: UInt64) {
+        let signpostID = OSSignpostID(log: Self.signpostLog)
+        os_signpost(.begin, log: Self.signpostLog, name: "Delivery", signpostID: signpostID,
+                    "ticket=%{public}llu skipped", ticket)
+        queue.async { [self] in
+            guard callerEpoch == epoch, ticket >= nextToEmit else {
+                os_signpost(.end, log: Self.signpostLog, name: "Delivery", signpostID: signpostID, "dropped")
+                return
+            }
+            pending[ticket] = PendingEntry(frame: nil, signpostID: signpostID)
             updatePendingCounts()
             drainReady()
         }
@@ -246,7 +268,7 @@ final class OrderedDelivery: @unchecked Sendable {
             if let entry = pending.removeValue(forKey: nextToEmit) {
                 nextToEmit &+= 1
                 stallLogPending = false
-                emit(entry.frame)
+                if let frame = entry.frame { emit(frame) }
                 os_signpost(.end, log: Self.signpostLog, name: "Delivery", signpostID: entry.signpostID)
                 continue
             }
@@ -264,8 +286,10 @@ final class OrderedDelivery: @unchecked Sendable {
             // spins the queue once per number when the backlog sits far ahead of the head.
             guard let oldest = pending.keys.min(), oldest > nextToEmit else {
                 nextToEmit &+= 1
+                stallSkippedTickets &+= 1
                 continue
             }
+            stallSkippedTickets &+= oldest &- nextToEmit
             nextToEmit = oldest
         }
     }
@@ -280,6 +304,9 @@ final class OrderedDelivery: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         #endif
         DoviDisplayMetadata.attach(rpuNAL: frame.dmNAL, to: frame.buffer.value)
+        if DoviDmPassthroughProbe.shared.isOn {
+            DoviDmPassthroughProbe.shared.observe(buffer: frame.buffer.value, key: DualLayerVideoDecoder.canonicalKey(pts: frame.pts), pts: frame.pts)
+        }
         onFrame?(frame.buffer.value, frame.pts, frame.hdr10Data)
     }
 
@@ -329,6 +356,7 @@ final class OrderedDelivery: @unchecked Sendable {
     /// here, only this note.
     var pendingCountForTesting: Int { queue.sync { pending.count } }
     var nextToEmitForTesting: UInt64 { queue.sync { nextToEmit } }
+    var stallSkippedTicketsForTesting: UInt64 { queue.sync { stallSkippedTickets } }
     var hasOnFrameForTesting: Bool { queue.sync { onFrame != nil } }
     var currentOnFrame: DecodedFrameHandler? { queue.sync { onFrame } }
 }

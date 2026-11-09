@@ -23,6 +23,72 @@ enum PresentationAxis {
     static func source(displayTime: Double, origin: Double) -> Double {
         displayTime + origin
     }
+
+    /// The origin a container's chapters are rebased onto, per backend, so that a published chapter start
+    /// is the value `seek(to:)` and `currentTime` use for it (`mediaChapters`). Live keeps origin 0 on both
+    /// routes (`PresentationOriginPolicy`).
+    ///
+    /// - `.native`: the origin the native session latches for a VOD source, the container start
+    ///   (`HLSVideoEngine.sourceStartSeconds`).
+    /// - `.software`: the session zero of the software clock. Once the host has anchored its clock that is
+    ///   the zero it reports (`softwareClockZero`), which is authoritative. Until then it is predicted the
+    ///   way the host derives it: `SWClockAnchorPolicy.resumeSessionZero` of the host's origin, the
+    ///   container start backed up by the video stream's own start (`sourceStartOrigin`), which is zero
+    ///   within the 2 s tolerance.
+    /// - Anything else (`.none`, the audio-only backends) has no established origin here, so the
+    ///   chapters stay on the raw container axis, as they were published before this rule.
+    static func containerChapterOrigin(backend: PlaybackBackend, formatStartSeconds: Double,
+                                       sourceStartOrigin: Double, softwareClockZero: Double? = nil,
+                                       isLive: Bool) -> Double {
+        if isLive, backend == .native || backend == .software { return 0 }
+        switch backend {
+        case .native:
+            return Swift.max(0, formatStartSeconds)
+        case .software:
+            return softwareClockZero ?? SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: sourceStartOrigin)
+        default:
+            return 0
+        }
+    }
+
+    /// The `seek(to:)` target for a disc chapter. Disc chapters are title-relative (0-based), the chapter's
+    /// source PTS is `sourceStartSeconds` (the source start origin) plus its start, and `seek(to:)` takes the
+    /// published axis of the active backend.
+    ///
+    /// - `.software`: the published axis is the session axis, source PTS minus the clock's session zero,
+    ///   and the host adds that zero back before the seek reaches the demuxer. A container start past the
+    ///   2 s tolerance becomes the session zero (`SWClockAnchorPolicy`), so adding the full
+    ///   `sourceStartSeconds` here as well applied the start twice and landed one start late. Only the part
+    ///   of the start the zero did not take is added: all of it inside the tolerance (zero 0), none of it
+    ///   past it. The host reports its zero through a main-actor hop, so until it arrives the zero is
+    ///   predicted the way the host derives it at load (`SWClockAnchorPolicy.resumeSessionZero`), which
+    ///   gives 0 for a start inside the tolerance.
+    /// - `.native`: the published axis is the 0-based display axis, the same one the disc chapters and the
+    ///   title duration are on (AE#105: a disc title's display origin is the playlist shift itself, and
+    ///   `seek(to:)` adds it back before it subtracts the shift again). Adding the shift here as well put
+    ///   the target a whole clip base past the chapter, beyond the title on a base of 599 s.
+    /// - Any other backend keeps the base it was written with, `playlistShiftSeconds`.
+    ///
+    /// `sourceStartSeconds` must be the origin the host derives its zero from
+    /// (`Demuxer.resolvedSourceStartOrigin`), so the zero cancels it on the software route.
+    ///
+    /// Never negative: the floor only covers a zero that re-anchored past the chapter's source PTS (a
+    /// first sample later than the chapter), which would otherwise ask for a position before the title.
+    static func discChapterSeekTarget(chapterStart: Double, backend: PlaybackBackend,
+                                      sourceStartSeconds: Double, playlistShiftSeconds: Double,
+                                      softwareClockZero: Double?) -> Double {
+        let base: Double
+        switch backend {
+        case .software:
+            base = sourceStartSeconds - (softwareClockZero
+                ?? SWClockAnchorPolicy.resumeSessionZero(sourceOriginSeconds: sourceStartSeconds))
+        case .native:
+            base = 0
+        default:
+            base = playlistShiftSeconds
+        }
+        return Swift.max(0, chapterStart + base)
+    }
 }
 
 /// Which source PTS maps to display-0 for a session (AE#105, AE#270).

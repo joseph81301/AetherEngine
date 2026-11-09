@@ -20,9 +20,17 @@ enum DualLayerRouteDecision: Equatable {
         case preferenceOff
         /// The package was built without the `DualLayerDolbyVision` trait, so there is no composer.
         case notBuiltIn
+        /// The enhancement layer is not in the video packets: it lives on its own PID or track and the demuxer folds
+        /// in only its RPUs (`BluRayDolbyVisionLayers`), so there is nothing to compose. A source whose layers the
+        /// demuxer can join (`Demuxer.enableDolbyVisionEnhancementLayerJoin`) never reaches this.
+        case enhancementLayerNotInPackets
         case baseLayerOnlyHandling
         case liveOrNotSeekable
         case noHardwareHEVC
+        /// An AirPlay receiver that shows video holds the audio route (iOS). It takes a stream, not a
+        /// composed picture, so the session keeps the native route (8.1 where the display takes Dolby
+        /// Vision; the enhancement layer is lost). An audio-only AirPlay output (a speaker) is not this reason.
+        case airPlayVideoReceiver
         case melEnhancementLayer
         case enhancementLayerTypeUnknown
         /// The base layer's width or height is not positive (the probe found none): the budget cannot be
@@ -99,15 +107,65 @@ enum DualLayerRouteDecision: Equatable {
         preferDualLayerDolbyVision: Bool,
         isLive: Bool,
         isSourceSeekable: Bool,
-        canHardwareDecode: (() -> Bool)?
+        canHardwareDecode: (() -> Bool)?,
+        enhancementLayerInPackets: Bool = true,
+        airPlayVideoReceiver: Bool = false
     ) -> Reason? {
         guard codecID == AV_CODEC_ID_HEVC, dvProfile == 7 else { return .notProfile7 }
         guard preferDualLayerDolbyVision else { return .preferenceOff }
         guard isBuiltIn else { return .notBuiltIn }
+        guard enhancementLayerInPackets else { return .enhancementLayerNotInPackets }
         guard dolbyVisionHandling == .automatic else { return .baseLayerOnlyHandling }
         guard !isLive, isSourceSeekable else { return .liveOrNotSeekable }
         guard canHardwareDecode?() ?? true else { return .noHardwareHEVC }
+        guard !airPlayVideoReceiver else { return .airPlayVideoReceiver }
         return nil
+    }
+
+    /// Whether the AVPlayer-output route is compiled in: the `DualLayerDolbyVision` trait, on every platform
+    /// the engine builds for (macOS, iOS, tvOS). Selectable on all of them; only the Mac has run it.
+    static var outputRouteIsBuiltIn: Bool {
+        #if DualLayerDolbyVision
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// Whether a load whose decision is `decision` plays on `LoadOptions.dualLayerRoute == .avPlayerOutput`.
+    /// The option only chooses between the two ways of composing a taken route: it never turns a refused
+    /// one on. `packetsAreHVCCFramed` is the source's length-prefixed framing, which the enhancement-layer
+    /// split reads; `frameRate` must be known, since the pull step and the dither parity follow it.
+    static func runsOnAVPlayerOutput(_ decision: DualLayerRouteDecision, route: DualLayerRoute,
+                                     packetsAreHVCCFramed: Bool, frameRate: Double?) -> Bool {
+        route == .avPlayerOutput && decision.isTaken && outputRouteIsBuiltIn && packetsAreHVCCFramed
+            && Self.isUsableFrameRate(frameRate)
+    }
+
+    static func isUsableFrameRate(_ frameRate: Double?) -> Bool {
+        guard let frameRate else { return false }
+        return frameRate.isFinite && frameRate > 0
+    }
+
+    /// Whether the route may start for the session about to be built. A load decides it, and so does every
+    /// rebuild of the session (the reload an AirPlay or external-display edge starts): when another screen
+    /// holds the picture the overlay would draw on a layer nobody sees, so AVPlayer keeps the picture and
+    /// shows the 8.1 base layer.
+    static func outputRouteMayStart(frameRate: Double?, externalPlaybackHoldsThePicture: Bool) -> Bool {
+        isUsableFrameRate(frameRate) && !externalPlaybackHoldsThePicture
+    }
+
+    /// The most forward-buffer segments (about 4 s each) the session may run ahead of the playhead on the
+    /// AVPlayer-output route. The history keeps the newest bytes, so the lead has to stay well inside what it holds
+    /// (1 GiB is about 100 s of a 86 Mbps stream, about 65 s at 130 Mbps).
+    static let maxForwardBufferSegments = 10
+
+    /// The forward-buffer window a session on the AVPlayer-output route is built with: the request, capped at
+    /// `maxForwardBufferSegments` so the producer's lead stays inside the history ring.
+    /// A session that does not use the route keeps the request (nil stays nil).
+    static func forwardBufferSegments(requested: Int?, usesOutputRoute: Bool) -> Int? {
+        guard usesOutputRoute, let requested else { return requested }
+        return min(requested, maxForwardBufferSegments)
     }
 
     /// The full decision. `elType` is the probe's answer ("FEL", "MEL", or nil when it found none).
@@ -121,12 +179,16 @@ enum DualLayerRouteDecision: Equatable {
         canHardwareDecode: (() -> Bool)?,
         elType: String?,
         geometry: Geometry,
-        enhancementLayerSize: (width: Int, height: Int)? = nil
+        enhancementLayerSize: (width: Int, height: Int)? = nil,
+        enhancementLayerInPackets: Bool = true,
+        airPlayVideoReceiver: Bool = false
     ) -> DualLayerRouteDecision {
         if let reason = blockingReasonBeforeProbe(
             codecID: codecID, dvProfile: dvProfile, dolbyVisionHandling: dolbyVisionHandling,
             preferDualLayerDolbyVision: preferDualLayerDolbyVision, isLive: isLive,
-            isSourceSeekable: isSourceSeekable, canHardwareDecode: canHardwareDecode) {
+            isSourceSeekable: isSourceSeekable, canHardwareDecode: canHardwareDecode,
+            enhancementLayerInPackets: enhancementLayerInPackets,
+            airPlayVideoReceiver: airPlayVideoReceiver) {
             return .notTaken(reason)
         }
         switch elType {
@@ -173,12 +235,16 @@ extension DualLayerRouteDecision.Reason {
             return "preferDualLayerDolbyVision is off"
         case .notBuiltIn:
             return "built without the DualLayerDolbyVision trait"
+        case .enhancementLayerNotInPackets:
+            return "enhancement layer on its own PID or track, only its RPUs are folded in"
         case .baseLayerOnlyHandling:
             return "dolbyVisionHandling is baseLayerOnly"
         case .liveOrNotSeekable:
             return "live or non-seekable source"
         case .noHardwareHEVC:
             return "no hardware HEVC decoder for this stream"
+        case .airPlayVideoReceiver:
+            return "an AirPlay video receiver holds the audio route and takes a stream, not a composed picture"
         case .melEnhancementLayer:
             return "el_type=MEL, nothing to compose"
         case .enhancementLayerTypeUnknown:

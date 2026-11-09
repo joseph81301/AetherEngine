@@ -4,17 +4,20 @@ import Foundation
 import TrueHD
 
 /// TrueHD object-presentation decoder over the LibTrueHD library (the Rust `truehd` crate behind
-/// a C API): lossless decode of presentation 3, which for an Atmos stream is the bed plus up to 15
-/// dynamic objects, together with the object audio metadata (OAMD) that positions them.
+/// a C API), for the engine's bed regression (see `BedRegression`).
 ///
-/// With `splitsBed` (the engine's TrueHD path, see `BedSplitter`) the decode is a different one:
-/// the matrix interpolation values are discarded, so the object signals are approximate, every block
-/// also carries the stream's channel-based presentation (Dolby's own 7.1 or 5.1 rendering of the mix)
-/// from the same access unit, and elements are described as plain point sources: the bridge then
-/// takes every output from that bed and only reads where the objects' energy lies.
+/// Every block carries the stream's channel-based presentation (Dolby's own lossless 7.1 or 5.1
+/// rendering of the mix) and, from the same access unit, presentation 3: the bed elements and up to
+/// 15 dynamic objects with the object audio metadata (OAMD) that positions them. Presentation 3 is
+/// decoded without matrix interpolation: the library leaves the interpolating decode out (LibTrueHD
+/// 3.2.0) and the handle discards the values as well, so on a stream that interpolates the element
+/// signals are approximate. They never reach an output: the bridge builds every output from the
+/// channel presentation and takes the elements only as statistics. Elements are point sources at
+/// their position with their gain; size, snap, zones, screen anchoring and the elevation switch
+/// are not read, and every update applies as it stands, without the ramp towards it.
 ///
 /// The library's coordinates are OAMD room coordinates (ETSI TS 103 420 4.2.1): x left→right and
-/// y front→back on 0...1, z −1 floor, 0 ear level, +1 ceiling. That is the renderer's own room
+/// y front→back on 0...1, z −1 floor, 0 ear level, +1 ceiling. That is the engine's own room
 /// model above ear level; home Atmos keeps objects at z ≥ 0, and anything below is clamped to the
 /// ear-level plane, which is the lowest a home bed has.
 final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
@@ -29,8 +32,6 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var roles: [ObjectAudioRole] = []
     private var rolesSerial: UInt32?
     private var planes: [UnsafePointer<Float>] = []
-    let splitsBed: Bool
-    var playsBedOnly: Bool { splitsBed }
     private var bedRoles: [ObjectAudioRole] = []
     private var bedRolesSerial: UInt32?
     private var bedPlanes: [UnsafePointer<Float>] = []
@@ -40,20 +41,13 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private let hold = ObjectMetadataHold()
     private var lent: ObjectMetadataHold.Copy?
 
-    /// `splitsBed` is false only for the measurement reference (`TrueHDReferenceRender` trait).
-    init(splitsBed: Bool = true) throws {
-        #if !TrueHDReferenceRender
-        precondition(splitsBed, "the exact decode and mix are only built with the TrueHDReferenceRender trait")
-        #endif
+    init() throws {
         guard let handle = truehd_atmos_decoder_create(TRUEHD_ATMOS_PRESENTATION_HIGHEST) else {
             throw DecoderError(status: TRUEHD_ATMOS_ERR_INVALID_ARGUMENT, message: "create failed")
         }
         self.handle = handle
-        self.splitsBed = splitsBed
-        if splitsBed {
-            _ = truehd_atmos_decoder_set_bed_companion(handle, true)
-            _ = truehd_atmos_decoder_set_ignore_interpolation(handle, true)
-        }
+        _ = truehd_atmos_decoder_set_bed_companion(handle, true)
+        _ = truehd_atmos_decoder_set_ignore_interpolation(handle, true)
     }
 
     deinit { truehd_atmos_decoder_destroy(handle) }
@@ -127,18 +121,18 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             let count = min(Int(md.element_count), channels)
             for u in 0..<Int(md.update_count) {
                 let update = md.updates[u]
-                if u == 0 { firstStates = (0..<count).map { state(for: update.elements[$0]) } }
+                if u == 0 { firstStates = (0..<count).map { Self.pointSource(for: update.elements[$0]) } }
                 var states: [ObjectAudioElementState?] = []
                 states.reserveCapacity(count)
                 for e in 0..<count {
                     let element = update.elements[e]
                     states.append(element.flags & TRUEHD_ATMOS_ELEMENT_CHANGED != 0
-                                  ? state(for: element) : nil)
+                                  ? Self.pointSource(for: element) : nil)
                 }
                 updates.append(ObjectAudioMetadataUpdate(
                     frameOffset: Int(update.frame_offset),
                     // Splitting the bed, each update is taken as it stands, without the ramp towards it.
-                    rampFrames: splitsBed ? 0 : Int(update.ramp_frames), states: states))
+                    states: states))
             }
         }
 
@@ -171,7 +165,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
 
     // MARK: - Mapping
 
-    /// Bed speakers the renderer's room model names route discretely; the other speaker codes
+    /// Bed speakers the engine's room model names route discretely; the other speaker codes
     /// (screen, centre back, top centre, surround direct) sit at their nominal position, so a
     /// channel-based presentation without metadata still plays them. Objects and unlabelled
     /// channels are positioned by metadata.
@@ -204,14 +198,6 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
     }
 
-    private func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
-        #if TrueHDReferenceRender
-        splitsBed ? Self.pointSource(for: element) : Self.state(for: element)
-        #else
-        Self.pointSource(for: element)
-        #endif
-    }
-
     /// An element as a point at its position: no size, snap, zone exclusion, screen anchoring or
     /// elevation switch. ISF elements, whose positions the library does not decode, sit in the room's
     /// centre.
@@ -220,60 +206,5 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         let p = element.kind == TRUEHD_ATMOS_ELEMENT_ISF ? (Float(0.5), Float(0.5), Float(0.5)) : element.position
         return ObjectAudioElementState(position: SIMD3(p.0, p.1, max(0, p.2)), gain: active ? element.gain : 0)
     }
-
-    #if TrueHDReferenceRender
-    // The reference render's mapping: size, snap, zones, screen anchoring and the elevation switch.
-    static func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
-        let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
-        var p = element.position
-        var size = max(element.size.0, element.size.1, element.size.2)
-        if element.kind == TRUEHD_ATMOS_ELEMENT_ISF {
-            // The library does not decode ISF (intermediate spatial format) positions, and no home
-            // content carrying them was found. Spread it over the room rather than pin it to
-            // whatever position value is left in the struct.
-            p = (0.5, 0.5, 0.5)
-            size = 1
-        } else if element.flags & TRUEHD_ATMOS_ELEMENT_SCREEN_REF != 0 {
-            // Screen-anchored: x across the screen and z −1…1 over its height, while y stays room
-            // depth (header, COORDINATES). A home room has no screen geometry to map that onto
-            // exactly, so the screen spans the front wall's width and its top sits halfway up the
-            // room rather than at the ceiling.
-            p = (p.0, p.1, max(0, p.2) * 0.5)
-        }
-        var excluded = excludedSpeakers(zone: element.zone)
-        if element.kind == TRUEHD_ATMOS_ELEMENT_OBJECT, element.flags & TRUEHD_ATMOS_ELEMENT_ELEVATION == 0 {
-            excluded.formUnion(heights)
-        }
-        return ObjectAudioElementState(
-            position: SIMD3(p.0, p.1, max(0, p.2)),
-            gain: active ? element.gain : 0,
-            size: size,
-            snap: element.flags & TRUEHD_ATMOS_ELEMENT_SNAP != 0,
-            excluded: excluded)
-    }
-
-    /// Built once: they run per changed element on every metadata update.
-    private static let heights = Set(SpatialSpeaker.allCases.filter(\.isHeight))
-    /// A 5.1 layout's surrounds are in neither zone: TS 103 448 table 4 excludes nothing for those
-    /// two masks on a 3/2 floor, and only screen-only takes the surrounds away.
-    private static let noBack: Set<SpatialSpeaker> = [.rearLeft, .rearRight]
-    private static let noSides: Set<SpatialSpeaker> = [.sideLeft, .sideRight, .wideLeft, .wideRight]
-    private static let screenOnly = noSides.union(noBack).union([.surroundLeft, .surroundRight])
-    private static let surroundOnly: Set<SpatialSpeaker> = [.left, .right, .center, .wideLeft, .wideRight]
-    /// Centre and back zones only: off the front pair, the wides and the sides.
-    private static let centerBack: Set<SpatialSpeaker> = [.left, .right, .wideLeft, .wideRight, .sideLeft, .sideRight]
-
-    /// OAMD horizontal zone constraints (TS 103 420 table 20) as speakers the object may not use.
-    static func excludedSpeakers(zone: UInt8) -> Set<SpatialSpeaker> {
-        switch zone {
-        case TRUEHD_ATMOS_ZONE_NO_BACK: return noBack
-        case TRUEHD_ATMOS_ZONE_NO_SIDES: return noSides
-        case TRUEHD_ATMOS_ZONE_CENTER_BACK: return centerBack
-        case TRUEHD_ATMOS_ZONE_SCREEN_ONLY: return screenOnly
-        case TRUEHD_ATMOS_ZONE_SURROUND_ONLY: return surroundOnly
-        default: return []
-        }
-    }
-    #endif
 }
 #endif

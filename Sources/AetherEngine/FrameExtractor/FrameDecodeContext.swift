@@ -30,6 +30,9 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// (main) title. Threaded into `Demuxer.open` so a still follows the currently-selected disc title
     /// instead of always decoding the default one (AE#105).
     private let selectTitleID: Int?
+    /// Wall-clock budget of one resident or bounded decode. Tests that hold the source on an I/O
+    /// gate widen it, so a slow runner cannot turn a deliberate wait into a deadline miss.
+    private let residentBudget: Duration
     /// Owned only during a controlled one-shot extraction. The ordinary URL and
     /// custom-reader paths retain their existing ownership rules.
     private var boundedReader: IOReader?
@@ -123,14 +126,27 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// How far inside the end a clamped past-EOF request lands, to reach a safely-decodable frame.
     static let clampBackoffSeconds: Double = 1.0
 
+    /// The origin the container's duration is measured from: `AVFormatContext.start_time` (in
+    /// AV_TIME_BASE units) when the container has one, else the video stream's own start. They differ
+    /// when another stream begins earlier than the video, and the span runs from the earlier one.
+    static func clampOrigin(formatStartTime: Int64, videoStartSeconds: Double?) -> Double {
+        if formatStartTime != Int64.min { return Double(formatStartTime) / Double(AV_TIME_BASE) }
+        return videoStartSeconds ?? 0
+    }
+
     /// Clamp a still-extraction seek target to the demuxer's known duration. Seeking far past EOF
     /// lands on a garbage/empty frame that decodes "successfully" but is blank (AE#105: a mis-selected
     /// decoy Blu-ray title whose demuxer knew only 76s while the scrub asked for 611s). Returns the
     /// request unchanged when the duration is unknown (<= 0) or the request is within tolerance of the
     /// end; otherwise the last safely-decodable position.
-    static func clampSeekSeconds(requested: Double, duration: Double) -> Double {
-        guard duration > 0, requested > duration + pastDurationTolerance else { return requested }
-        return max(0, duration - clampBackoffSeconds)
+    ///
+    /// `duration` is the container's span, measured from the container's own start time, and
+    /// `requested` is on the source axis. `start` is that container origin (see `clampOrigin`), so
+    /// the end is `start + duration`.
+    static func clampSeekSeconds(requested: Double, duration: Double, start: Double = 0) -> Double {
+        let origin = start.isFinite ? max(0, start) : 0
+        guard duration > 0, requested > origin + duration + pastDurationTolerance else { return requested }
+        return max(origin, origin + duration - clampBackoffSeconds)
     }
 
     init(url: URL, httpHeaders: [String: String], selectTitleID: Int? = nil,
@@ -142,9 +158,11 @@ final class FrameDecodeContext: @unchecked Sendable {
         self.formatHint = nil
         self.selectTitleID = selectTitleID
         self.allowsHardwareDecode = allowsHardwareDecode
+        self.residentBudget = .milliseconds(750)
     }
 
-    init(reader: IOReader, formatHint: String?, allowsHardwareDecode: Bool = false) {
+    init(reader: IOReader, formatHint: String?, allowsHardwareDecode: Bool = false,
+         residentBudget: Duration = .milliseconds(750)) {
         // Placeholder; unused when reader != nil (openInternal opens the reader).
         self.url = URL(string: "aether-custom://frame-extractor")!
         self.openedHTTPHeaders = [:]
@@ -157,6 +175,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         // public custom-reader/network caller on the issue #27 software default. The 2026-09-02
         // device trace measured 30 software context opens in 20 seconds over resident H.264 bytes.
         self.allowsHardwareDecode = allowsHardwareDecode || reader is DataIOReader
+        self.residentBudget = residentBudget
     }
 
     deinit {
@@ -344,13 +363,6 @@ final class FrameDecodeContext: @unchecked Sendable {
             activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
         ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
 
-        // Still extraction needs no deblock or full-rate quality: skip loop filter
-        // and enable the fast/inaccurate path to cut per-frame CPU on big HEVC/AV1 keyframes.
-        // AV_CODEC_FLAG2_FAST is a C #define (1 << 0) that does not bridge to Swift.
-        let AV_CODEC_FLAG2_FAST_VALUE: Int32 = 1 << 0
-        ctx.pointee.skip_loop_filter = AVDISCARD_ALL
-        ctx.pointee.flags2 |= AV_CODEC_FLAG2_FAST_VALUE
-
         var opts: OpaquePointer?
         if !useHardware {
             // Belt-and-suspenders with the software get_format callback above.
@@ -424,10 +436,14 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// Decode one frame at/after `seconds`.
     ///
     /// - thumbnail: first frame after the seek (keyframe), downscaled to `targetWidth`.
+    /// - preview: decode forward until pts >= seconds, downscaled to `targetWidth`.
     /// - snapshot: decode forward until pts >= seconds, return at `maxSize` (aspect-preserved) or native.
     ///
     /// `isCancelled` is polled between packets and before conversion so a superseded scrub
     /// bails promptly. Returns nil on EOF / decode failure / cancellation. Frees all FFmpeg allocs.
+    ///
+    /// A resident decode always stops at the 750 ms / 900 packet bound; `bounded` applies the same
+    /// bound to a decode of any other kind.
     func decodeFrame(
         at seconds: Double,
         mode: FrameMode,
@@ -438,12 +454,23 @@ final class FrameDecodeContext: @unchecked Sendable {
         residentTarget: Double? = nil,
         reportResidentTime: ((Double, Bool) -> Void)? = nil,
         residentDeadline: ContinuousClock.Instant? = nil,
-        reportDecodedTime: ((Double?) -> Void)? = nil
+        reportDecodedTime: ((Double?) -> Void)? = nil,
+        bounded: Bool = false
     ) -> CGImage? {
         guard isOpen, let ctx = codecContext, let demuxer else { return nil }
         // Without the reshaping these planes are IPT, which the standard path would read as YCbCr
         // (the green / magenta still of #103): no still at all, and nothing read or decoded for it.
         guard Self.yieldsStill(dolbyVisionNoBaseLayer: isDolbyVisionNoBaseLayer) else { return nil }
+
+        // Full reconstruction matters for previews and snapshots; only coarse keyframe
+        // thumbnails opt into skipped loop filtering and the codec's inaccurate fast path.
+        let codecFastFlag: Int32 = 1 << 0 // AV_CODEC_FLAG2_FAST does not bridge to Swift.
+        ctx.pointee.skip_loop_filter = mode.isFrameAccurate ? AVDISCARD_DEFAULT : AVDISCARD_ALL
+        if mode.isFrameAccurate {
+            ctx.pointee.flags2 &= ~codecFastFlag
+        } else {
+            ctx.pointee.flags2 |= codecFastFlag
+        }
 
         // Bound this decode's HTTP reads so a stalled remote source can't park the
         // serial decode queue and freeze the scrub preview (issue #27). No-op for
@@ -462,7 +489,10 @@ final class FrameDecodeContext: @unchecked Sendable {
         // past EOF returns a blank garbage frame that still reports success (AE#105). Both the seek and
         // the forward-decode target below must use the clamped value or snapshot would chase an
         // unreachable PTS forever.
-        let seekSeconds = Self.clampSeekSeconds(requested: seconds, duration: demuxer.duration)
+        // The target axis stays the video stream's; only the end of the span is measured from the container.
+        let containerStart = Self.clampOrigin(formatStartTime: demuxer.formatStartTime,
+                                              videoStartSeconds: presentationStartSeconds)
+        let seekSeconds = Self.clampSeekSeconds(requested: seconds, duration: demuxer.duration, start: containerStart)
         if seekSeconds != seconds {
             EngineLog.emit(
                 "[FrameExtractor] still past duration: t=\(String(format: "%.2f", seconds))s "
@@ -490,7 +520,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             guard let ticks = Demuxer.ticks(forSeconds: max(0, offsetSeconds), timeBase: timeBase) else { return nil }
             offsetTicks = ticks
         }
-        let deadline = residentDeadline ?? ContinuousClock.now.advanced(by: .milliseconds(750))
+        let deadline = residentDeadline ?? ContinuousClock.now.advanced(by: residentBudget)
         var packetCount = 0
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
@@ -537,12 +567,12 @@ final class FrameDecodeContext: @unchecked Sendable {
                     av_frame_free(&transferredFrame)
                 }
             }
-            let width = mode == .thumbnail
+            let sar = resolvedSAR(frame: f)
+            let width = mode.usesTargetWidth
                 ? targetWidth
-                : Self.clampedWidth(frame: f, maxSize: maxSize)
+                : Self.clampedWidth(frame: f, sar: sar, maxSize: maxSize)
             #if DolbyVisionStillReshaping
             if isDolbyVisionNoBaseLayer {
-                let sar = resolvedSAR(frame: f)
                 if let img = DolbyVisionStillConverter.makeImage(frame: f, targetWidth: width, sar: sar) {
                     return img
                 }
@@ -550,14 +580,15 @@ final class FrameDecodeContext: @unchecked Sendable {
             }
             #endif
             if isHDR {
-                var toned = HDRToneMapper.toneMap(frame: f, targetWidth: width, timeBase: timeBase)
+                var toned = HDRToneMapper.toneMap(frame: f, targetWidth: width, timeBase: timeBase,
+                                                 sar: sar, highQuality: mode.isFrameAccurate)
                 if toned != nil {
                     defer { av_frame_free(&toned) }
                     if let img = Self.cgImageFromRGBAFrame(toned!) { return img }
                 }
                 // tone-map failed: fall through to sws path (degraded but non-nil)
             }
-            return convertToCGImage(frame: f, targetWidth: width)
+            return convertToCGImage(frame: f, targetWidth: width, highQuality: mode.isFrameAccurate)
         }
 
         // Once the demuxer hits EOF, flush the decoder (NULL packet) and keep draining: the
@@ -566,7 +597,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         var draining = false
         while true {
             if isCancelled() { return nil }
-            if residentTarget != nil, (ContinuousClock.now >= deadline || packetCount >= 900) { return nil }
+            if residentTarget != nil || bounded, (ContinuousClock.now >= deadline || packetCount >= 900) { return nil }
 
             if !draining {
                 let packetOrNil: UnsafeMutablePointer<AVPacket>?
@@ -617,9 +648,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                     targetPTS = f.pointee.pts + ticks
                     offsetTicks = nil
                 }
-                if mode == .snapshot,
-                   f.pointee.pts != Int64.min,
-                   f.pointee.pts < targetPTS {
+                if !mode.accepts(framePTS: f.pointee.pts, targetPTS: targetPTS) {
                     continue
                 }
 
@@ -640,7 +669,8 @@ final class FrameDecodeContext: @unchecked Sendable {
                         residentTarget: residentTarget,
                         reportResidentTime: reportResidentTime,
                         residentDeadline: deadline,
-                        reportDecodedTime: reportDecodedTime)
+                        reportDecodedTime: reportDecodedTime,
+                        bounded: bounded)
                 }
                 if let residentTarget {
                     guard f.pointee.pts != Int64.min else { return nil }
@@ -670,15 +700,21 @@ final class FrameDecodeContext: @unchecked Sendable {
         return (dstW, dstH)
     }
 
-    /// Snapshot output width: native width, optionally capped to `maxSize` (aspect-preserved).
-    private static func clampedWidth(frame: UnsafeMutablePointer<AVFrame>, maxSize: CGSize?) -> Int {
+    /// Snapshot bounds apply to square-pixel output, after the source SAR corrects its shape.
+    private static func clampedWidth(frame: UnsafeMutablePointer<AVFrame>, sar: AVRational,
+                                     maxSize: CGSize?) -> Int {
         let nativeW = Int(frame.pointee.width)
         let nativeH = Int(frame.pointee.height)
         guard let maxSize, maxSize.width > 0, maxSize.height > 0, nativeW > 0, nativeH > 0 else {
             return nativeW
         }
-        let scale = min(maxSize.width / CGFloat(nativeW), maxSize.height / CGFloat(nativeH), 1.0)
-        return max(1, Int((CGFloat(nativeW) * scale).rounded()))
+        let displayHeight = CGFloat(nativeH) * CGFloat(sar.den) / CGFloat(sar.num)
+        // Whole output pixels must fit both limits, including fractional CGSize bounds.
+        // Keep the width bound in pixels: dividing by nativeW and multiplying back can
+        // turn an exactly fitting integer into the preceding representable value.
+        let heightLimitedWidth = maxSize.height.rounded(.down) * CGFloat(nativeW) / displayHeight
+        let width = min(CGFloat(nativeW), maxSize.width.rounded(.down), heightLimitedWidth)
+        return max(1, Int(width.rounded(.down)))
     }
 
     /// Copy an RGBA AVFrame (e.g. tone-mapper output) into an owned-buffer CGImage.
@@ -749,7 +785,7 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     /// sws_scale the frame to RGBA at `targetWidth` (height from source aspect) into an
     /// owned-buffer CGImage. Mirrors the sws tuple-pointer dance in SoftwareVideoDecoder.
-    private func convertToCGImage(frame: UnsafeMutablePointer<AVFrame>, targetWidth: Int) -> CGImage? {
+    private func convertToCGImage(frame: UnsafeMutablePointer<AVFrame>, targetWidth: Int, highQuality: Bool) -> CGImage? {
         let srcW = Int(frame.pointee.width)
         let srcH = Int(frame.pointee.height)
         guard srcW > 0, srcH > 0, targetWidth > 0 else { return nil }
@@ -766,7 +802,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             swsContext,
             Int32(srcW), Int32(srcH), srcFmt,
             Int32(dstW), Int32(dstH), AV_PIX_FMT_RGBA,
-            Int32(SWS_BILINEAR.rawValue), nil, nil, nil
+            Int32((highQuality ? SWS_BICUBIC : SWS_BILINEAR).rawValue), nil, nil, nil
         )
         guard swsContext != nil else { return nil }
         // Without this sws converts every picture with its BT.601 default, which put a 1080p

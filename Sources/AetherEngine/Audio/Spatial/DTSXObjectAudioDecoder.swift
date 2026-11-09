@@ -1,182 +1,378 @@
-// Only with the DTSXObjectAudio trait (off by default), which links LibDTSX.
+// Only with the DTSXObjectAudio trait (off by default).
 #if DTSXObjectAudio
 import Foundation
-import DTSX
+import AetherLibavcodec
+import AetherLibavutil
 
-/// DTS:X decoder over the LibDTSX library (the Rust `dca` crate behind a C API): lossless decode of
-/// the DTS-HD Master Audio stream DTS:X is carried on, in its standard presentation only. The
-/// library removes the four heights from the compatible 7.1 bed, where the encoder folded each at
-/// -3 dB into the speaker under it, and refuses the alternate presentations, which carry objects.
-/// What is left here is naming the twelve channels, each of which plays on its own speaker of a
-/// 7.1.4 or 9.1.6 layout.
+/// DTS:X decoder over FFmpeg's own `dca` decoder: lossless decode of the DTS-HD Master Audio stream
+/// DTS:X is carried on. The standard presentation carries its four heights in a regular XLL channel set
+/// at the end of every frame, and the encoder folds each of them at -3 dB into the bed speaker under it.
+/// The alternate presentations (FFmpeg labels some "DTS:X IMAX") carry the same four heights after one
+/// to five object channels. FFmpegBuild's `x_heights` option (a local patch, #798) decodes the heights
+/// of both and outputs them next to the bed as coded, heights still folded in; the objects are never
+/// decoded and stay in the bed. Which presentation the heights came from decides their fold
+/// (`foldGain(presentation:)`), and one whose fold has not been measured is refused.
+///
+/// Every block hands over that bed with the four heights as its elements and their folds, and every
+/// output is built from the bed alone (`BedRegression`): the heights steer it, as statistics, and never
+/// play themselves. Each of the twelve channels has its own speaker in a 7.1.4 or 9.1.6 layout.
 final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
 
     struct DecoderError: Error, CustomStringConvertible {
-        let status: Int32
         let message: String
-        var description: String { "DTSXObjectAudioDecoder: status \(status) \(message)" }
+        var description: String { "DTSXObjectAudioDecoder: \(message)" }
     }
 
     /// What the first frames of a stream showed (see `verdict(feeding:)`).
     enum Verdict: Equatable {
-        /// DTS:X the decoder renders, named by its layout ("7.1.4", "7.1.4+2").
+        /// DTS:X the decoder renders, named by its layout ("7.1.4").
         case renders(String)
-        /// Not DTS:X, or DTS:X the library does not render; the message says which.
+        /// Not DTS:X, or DTS:X in a presentation this decoder does not render; the message says which.
         case refused(String)
     }
 
-    private let handle: OpaquePointer
-    private var roles: [ObjectAudioRole] = []
-    private var rolesSerial: UInt32?
-    private var planes: [UnsafePointer<Float>] = []
-    private(set) var selfResetCount = 0
+    /// The standard presentation's channels in the order every block carries them, whatever the frame
+    /// had: the 7.1 bed, then the top front and top back pairs.
+    static let channels: [(AVChannel, ObjectAudioRole)] = [
+        (AV_CHAN_FRONT_CENTER, .bed(.center)), (AV_CHAN_FRONT_LEFT, .bed(.left)),
+        (AV_CHAN_FRONT_RIGHT, .bed(.right)), (AV_CHAN_SIDE_LEFT, .bed(.sideLeft)),
+        (AV_CHAN_SIDE_RIGHT, .bed(.sideRight)), (AV_CHAN_LOW_FREQUENCY, .lfe),
+        (AV_CHAN_BACK_LEFT, .bed(.rearLeft)), (AV_CHAN_BACK_RIGHT, .bed(.rearRight)),
+        (AV_CHAN_TOP_FRONT_LEFT, .bed(.topFrontLeft)), (AV_CHAN_TOP_FRONT_RIGHT, .bed(.topFrontRight)),
+        (AV_CHAN_TOP_BACK_LEFT, .bed(.topRearLeft)), (AV_CHAN_TOP_BACK_RIGHT, .bed(.topRearRight)),
+    ]
+    /// The first eight channels, the 7.1 bed as coded.
+    static let bedCount = 8
+    static let bedRoles = channels.prefix(bedCount).map(\.1)
+    /// The four heights, a block's elements.
+    static let roles = channels.dropFirst(bedCount).map(\.1)
+    /// The encoder's fold of each height into the bed: front heights into L and R, rear heights into
+    /// the rear surrounds, at gain code 23170/32768 (-3 dB) in the standard presentation. The same in
+    /// every frame of all 12 DTS:X tracks measured (8.76 million frames), so it is the format's, not
+    /// read from the stream.
+    static let folds = folds(gain: standardFoldGain)
+    static let standardFoldGain: Float = 23170 / 32768
+    /// The same fold at unity, for the alternate presentation that folds that way.
+    static let unityFolds = folds(gain: 1)
 
-    init() throws {
-        guard let handle = dtsx_decoder_create() else {
-            throw DecoderError(status: DTSX_ERR_INVALID_ARGUMENT, message: "create failed")
+    static func folds(gain: Float) -> [ObjectAudioBedFold] {
+        [
+            (SpatialSpeaker.topFrontLeft, SpatialSpeaker.left), (.topFrontRight, .right),
+            (.topRearLeft, .rearLeft), (.topRearRight, .rearRight),
+        ].map { height, speaker in
+            ObjectAudioBedFold(element: roles.firstIndex(of: .bed(height))!,
+                               plane: bedRoles.firstIndex(of: .bed(speaker))!,
+                               gain: gain)
         }
-        self.handle = handle
     }
 
-    deinit { dtsx_decoder_destroy(handle) }
-
-    /// Feeds one packet from the head of a stream and reports what it decodes, or nil while that is
-    /// undecided. FFmpeg names only two of DTS:X's markers, so a track it labels plain DTS-HD MA can
-    /// be DTS:X, and one it labels DTS:X can carry a presentation the library refuses: only a decoded
-    /// frame tells. The library decides on the first frame and outputs from the third (the first two
-    /// only rebuild the core's filter history), so a verdict takes three packets of DTS-HD. A stream
-    /// counts as rendered once a block arrives whose DTS:X extension applied.
-    func verdict(feeding bytes: UnsafeRawBufferPointer) -> Verdict? {
-        guard let base = bytes.baseAddress, bytes.count > 0 else { return nil }
-        var status = dtsx_decoder_push(handle, base.assumingMemoryBound(to: UInt8.self), bytes.count, Int64.min)
-        var block = DTSXBlock()
-        while status == DTSX_OK {
-            status = dtsx_decoder_pull(handle, &block)
-            if status == DTSX_OK {
-                // The renderer and the APAC encoder run at 48 kHz; the track's label said so, the
-                // stream itself has the last word.
-                guard block.sample_rate == 48000 else {
-                    return .refused("\(block.sample_rate) Hz")
-                }
-                guard block.flags & DTSX_BLOCK_BED_AS_AUTHORED == 0 else {
-                    return .refused("its DTS:X extension could not be applied (\(lastError))")
-                }
-                return .renders(String(cString: dtsx_presentation_name(block.presentation)))
-            }
-        }
-        return status == DTSX_NEED_MORE_DATA ? nil : .refused(lastError)
-    }
-
-    func push(_ bytes: UnsafeRawBufferPointer) throws {
-        guard let base = bytes.baseAddress, bytes.count > 0 else { return }
-        let status = dtsx_decoder_push(handle, base.assumingMemoryBound(to: UInt8.self), bytes.count, Int64.min)
-        // BUFFER_FULL (8 MiB waiting) cannot happen behind the bridge, which drains every block after
-        // each push; a panic resets for the same reason as in `nextBlock`.
-        if status == DTSX_ERR_PANIC {
-            let failure = error(status)
-            reset()
-            selfResetCount += 1
-            throw failure
-        }
-        guard status == DTSX_OK else { throw error(status) }
-    }
-
-    func nextBlock() throws -> ObjectAudioDecodedBlock? {
-        var block = DTSXBlock()
-        let status = dtsx_decoder_pull(handle, &block)
-        if status == DTSX_NEED_MORE_DATA { return nil }
-        if status == DTSX_ERR_PANIC {
-            // The handle refuses every call until it is reset. Reset it here, so the stream resumes
-            // at the next frame instead of staying silent for the rest of the session.
-            let failure = error(status)
-            reset()
-            selfResetCount += 1
-            throw failure
-        }
-        guard status == DTSX_OK else { throw error(status) }
-
-        let channels = Int(block.channel_count)
-        if rolesSerial != block.layout_serial {
-            var named: [ObjectAudioRole] = []
-            for c in 0..<channels {
-                guard let role = Self.role(forSpeaker: block.speakers[c]) else {
-                    throw DecoderError(status: DTSX_ERR_UNSUPPORTED,
-                                       message: "channel with speaker code \(block.speakers[c]) outside DTS:X's 7.1.4")
-                }
-                named.append(role)
-            }
-            roles = named
-            rolesSerial = block.layout_serial
-        }
-        planes.removeAll(keepingCapacity: true)
-        for c in 0..<channels { planes.append(UnsafePointer(block.channels[c]!)) }
-
-        var updates: [ObjectAudioMetadataUpdate] = []
-        if block.flags & DTSX_BLOCK_METADATA_UPDATED != 0, let metadata = block.metadata {
-            let md = metadata.pointee
-            let count = min(Int(md.element_count), channels)
-            for u in 0..<Int(md.update_count) {
-                let update = md.updates[u]
-                var states: [ObjectAudioElementState?] = []
-                states.reserveCapacity(count)
-                for e in 0..<count {
-                    let element = update.elements[e]
-                    states.append(element.flags & DTSX_ELEMENT_CHANGED != 0 ? Self.state(for: element) : nil)
-                }
-                updates.append(ObjectAudioMetadataUpdate(
-                    frameOffset: Int(update.frame_offset), rampFrames: Int(update.ramp_frames), states: states))
-            }
-        }
-
-        return ObjectAudioDecodedBlock(
-            sampleRate: Int(block.sample_rate),
-            frameCount: Int(block.frame_count),
-            inputFrameOffset: Int64(block.input_frame_offset),
-            configurationGeneration: Int(block.layout_serial),
-            isDiscontinuity: block.flags & DTSX_BLOCK_DISCONTINUITY != 0,
-            roles: roles,
-            planes: planes,
-            updates: updates)
-    }
-
-    func reset() {
-        _ = dtsx_decoder_reset(handle)
-    }
-
-    private var lastError: String { String(cString: dtsx_decoder_last_error(handle)) }
-
-    private func error(_ status: Int32) -> DecoderError {
-        DecoderError(status: status, message: lastError)
-    }
-
-    // MARK: - Mapping
-
-    /// The speaker codes are LibTrueHD's: the standard presentation's 7.1 bed and its top front and
-    /// top back pairs, each on its own speaker. LibDTSX outputs no other channel.
-    static func role(forSpeaker code: UInt8) -> ObjectAudioRole? {
-        switch code {
-        case DTSX_SPEAKER_LFE: return .lfe
-        case DTSX_SPEAKER_L: return .bed(.left)
-        case DTSX_SPEAKER_R: return .bed(.right)
-        case DTSX_SPEAKER_C: return .bed(.center)
-        case DTSX_SPEAKER_LS: return .bed(.sideLeft)
-        case DTSX_SPEAKER_RS: return .bed(.sideRight)
-        case DTSX_SPEAKER_LB: return .bed(.rearLeft)
-        case DTSX_SPEAKER_RB: return .bed(.rearRight)
-        case DTSX_SPEAKER_TFL: return .bed(.topFrontLeft)
-        case DTSX_SPEAKER_TFR: return .bed(.topFrontRight)
-        case DTSX_SPEAKER_TBL: return .bed(.topRearLeft)
-        case DTSX_SPEAKER_TBR: return .bed(.topRearRight)
+    /// The height fold of a presentation, by the decoder's `x_presentation`: 1 the standard one, else
+    /// the low byte of the alternate presentation's syncword. The fold is the profile's, never read from
+    /// the stream's metadata. D0 (*Bad Boys for Life*, labelled "DTS:X IMAX") folds at unity, D1 and D3
+    /// at -3 dB (harletty-bridge's dca analysis, the D0 unity fold reproduced to the LSB there). D4 has
+    /// not been measured and is nil, so it is refused and plays as its 7.1 bed.
+    static func foldGain(presentation: Int64) -> Float? {
+        switch presentation {
+        case 1, 0xd1, 0xd3: return standardFoldGain
+        case 0xd0: return 1
         default: return nil
         }
     }
 
+    /// Frames decoded after a reset only to rebuild the core's filter history, which the lossless
+    /// residual is coded against. Entered mid-stream, the first frame reconstructs as distorted audio
+    /// and the second can still err by -16 dBFS (measured with LibDTSX over 110 seeks into four DTS:X
+    /// streams); from the third the error decays to bit-exact within about ten frames.
+    static let primingFrames = 2
+    /// Decoded frames without heights after which `verdict(feeding:)` refuses a stream.
+    static let verdictFrames = 8
+
+    private struct Pending {
+        var samples: UnsafeMutablePointer<Float>
+        var frameCount: Int
+        var inputFrameOffset: Int64
+        var isDiscontinuity: Bool
+        var foldGain: Float
+    }
+
+    private let context: UnsafeMutablePointer<AVCodecContext>
+    private var parser: UnsafeMutablePointer<AVCodecParserContext>
+    private let packet: UnsafeMutablePointer<AVPacket>
+    private let frame: UnsafeMutablePointer<AVFrame>
+    private var pending: [Pending] = []
+    private var lent: UnsafeMutablePointer<Float>?
+    private var planes: [UnsafePointer<Float>] = []
+    private var bedPlanes: [UnsafePointer<Float>] = []
+    /// Frames of input taken since the last reset, decoded or not.
+    private var inputFrames: Int64 = 0
+    private var priming = primingFrames
+    private var discontinuity = true
+    /// Samples in the last frame that decoded, for one that did not.
+    private var nominalFrames = 512
+    private var framesWithoutHeights = 0
+
+    init() throws {
+        guard let codec = avcodec_find_decoder(AV_CODEC_ID_DTS),
+              let context = avcodec_alloc_context3(codec) else {
+            throw DecoderError(message: "no dca decoder in this FFmpeg")
+        }
+        var options: OpaquePointer?
+        av_dict_set(&options, "x_heights", "1", 0)
+        let opened = avcodec_open2(context, codec, &options)
+        // An option the decoder does not know stays in the dictionary: an FFmpegBuild without the patch.
+        let unknown = av_dict_get(options, "x_heights", nil, 0) != nil
+        av_dict_free(&options)
+        var parser = av_parser_init(Int32(AV_CODEC_ID_DTS.rawValue))
+        var packet = av_packet_alloc()
+        var frame = av_frame_alloc()
+        guard opened >= 0, !unknown, let parser, let packet, let frame else {
+            if let parser { av_parser_close(parser) }
+            av_packet_free(&packet)
+            av_frame_free(&frame)
+            var owned: UnsafeMutablePointer<AVCodecContext>? = context
+            avcodec_free_context(&owned)
+            throw DecoderError(message: unknown
+                ? "this FFmpegBuild cannot decode DTS:X heights (no x_heights option)"
+                : "dca decoder did not open (\(FFmpegErr.text(for: opened)))")
+        }
+        self.context = context
+        self.parser = parser
+        self.packet = packet
+        self.frame = frame
+    }
+
+    deinit {
+        dropPending()
+        av_parser_close(parser)
+        var packet: UnsafeMutablePointer<AVPacket>? = self.packet
+        av_packet_free(&packet)
+        var frame: UnsafeMutablePointer<AVFrame>? = self.frame
+        av_frame_free(&frame)
+        var context: UnsafeMutablePointer<AVCodecContext>? = self.context
+        avcodec_free_context(&context)
+    }
+
+    /// Feeds packets from the head of a stream and reports what its decoded frames are, or nil while
+    /// that is undecided. The probe's profile label rests on the frames it read, so only a decoded
+    /// frame tells: a stream renders once one comes out as 7.1.4. One that does not is refused after
+    /// `verdictFrames` of them, since a stream entered inside a peak-bit-rate smoothing period
+    /// decodes its first frames from the lossy core alone.
+    func verdict(feeding bytes: UnsafeRawBufferPointer) -> Verdict? {
+        var verdict: Verdict?
+        do {
+            try parse(bytes) { [self] in
+                guard verdict == nil else { return }
+                guard frame.pointee.sample_rate == Int32(ObjectAudioRendering.sampleRate) else {
+                    verdict = .refused("\(frame.pointee.sample_rate) Hz")
+                    return
+                }
+                if (8..<12).allSatisfy({ carries(Self.channels[$0].0) }) {
+                    let presentation = self.presentation
+                    verdict = Self.foldGain(presentation: presentation) != nil
+                        ? .renders("7.1.4")
+                        : .refused("DTS:X in alternate presentation 0x\(String(presentation, radix: 16)), whose height fold is not known, which plays as its 7.1 bed")
+                } else {
+                    framesWithoutHeights += 1
+                    if framesWithoutHeights >= Self.verdictFrames { verdict = .refused(presentationText) }
+                }
+            }
+        } catch {
+            return .refused("\(error)")
+        }
+        return verdict
+    }
+
+    func push(_ bytes: UnsafeRawBufferPointer) throws {
+        releaseLent()
+        try parse(bytes) { [self] in try takeFrame() }
+    }
+
+    func nextBlock() throws -> ObjectAudioDecodedBlock? {
+        releaseLent()
+        guard !pending.isEmpty else { return nil }
+        let block = pending.removeFirst()
+        lent = block.samples
+        planes.removeAll(keepingCapacity: true)
+        bedPlanes.removeAll(keepingCapacity: true)
+        for c in 0..<Self.channels.count {
+            let plane = UnsafePointer(block.samples + c * block.frameCount)
+            if c < Self.bedCount { bedPlanes.append(plane) } else { planes.append(plane) }
+        }
+        // Every height sits on its speaker at unity. The placement holds an element nowhere until its
+        // first state, so the whole set is restated, as a jump, wherever the decoder started over.
+        var updates: [ObjectAudioMetadataUpdate] = []
+        if block.isDiscontinuity {
+            updates.append(ObjectAudioMetadataUpdate(
+                frameOffset: 0, states: Self.roles.map(Self.state(for:))))
+        }
+        return ObjectAudioDecodedBlock(
+            sampleRate: ObjectAudioRendering.sampleRate,
+            frameCount: block.frameCount,
+            inputFrameOffset: block.inputFrameOffset,
+            configurationGeneration: 1,
+            isDiscontinuity: block.isDiscontinuity,
+            roles: Self.roles,
+            planes: planes,
+            updates: updates,
+            bed: ObjectAudioBed(roles: Self.bedRoles, planes: bedPlanes,
+                                folds: block.foldGain == 1 ? Self.unityFolds : Self.folds))
+    }
+
+
+    func reset() {
+        dropPending()
+        avcodec_flush_buffers(context)
+        av_parser_close(parser)
+        parser = av_parser_init(Int32(AV_CODEC_ID_DTS.rawValue))!
+        inputFrames = 0
+        priming = Self.primingFrames
+        discontinuity = true
+        framesWithoutHeights = 0
+    }
+
+    /// The parser holds the last frame until the next one's syncword shows where it ends; this hands
+    /// it to the decoder now. A new parser takes the input that follows.
+    func releaseHeldBlocks() {
+        releaseLent()
+        try? parse(nil) { [self] in try takeFrame() }
+        av_parser_close(parser)
+        parser = av_parser_init(Int32(AV_CODEC_ID_DTS.rawValue))!
+    }
+
+    // MARK: - Decoding
+
+    /// Splits `bytes` into frames, decodes each and calls `onFrame` with every decoded frame in
+    /// `frame`. A frame that does not decode still counts towards the input offsets. Nil flushes the
+    /// frame the parser holds.
+    private func parse(_ bytes: UnsafeRawBufferPointer?, onFrame: () throws -> Void) throws {
+        var data = bytes?.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        var remaining = Int32(bytes?.count ?? 0)
+        repeat {
+            var out: UnsafeMutablePointer<UInt8>?
+            var outSize: Int32 = 0
+            let used = av_parser_parse2(parser, context, &out, &outSize, data, remaining,
+                                        Int64.min, Int64.min, 0)
+            guard used >= 0 else { throw DecoderError(message: "parser: \(FFmpegErr.text(for: used))") }
+            data = data.map { $0 + Int(used) }
+            remaining -= used
+            if let out, outSize > 0 {
+                try decode(out, outSize, onFrame: onFrame)
+            } else if used == 0 {
+                break
+            }
+        } while remaining > 0
+    }
+
+    private func decode(_ data: UnsafeMutablePointer<UInt8>, _ size: Int32, onFrame: () throws -> Void) throws {
+        packet.pointee.data = data
+        packet.pointee.size = size
+        defer { packet.pointee.data = nil; packet.pointee.size = 0 }
+        let parsedFrames = parser.pointee.duration > 0 ? Int(parser.pointee.duration) : nominalFrames
+        guard avcodec_send_packet(context, packet) >= 0 else {
+            // EINVAL and INVALIDDATA reject this frame and leave the decoder usable for the next (#64).
+            skip(frames: parsedFrames)
+            return
+        }
+        var decodedAny = false
+        while avcodec_receive_frame(context, frame) >= 0 {
+            defer { av_frame_unref(frame) }
+            decodedAny = true
+            nominalFrames = Int(frame.pointee.nb_samples)
+            try onFrame()
+        }
+        if !decodedAny { skip(frames: parsedFrames) }
+    }
+
+    private func skip(frames: Int) {
+        inputFrames += Int64(frames)
+        discontinuity = true
+    }
+
+    /// Converts the decoded frame into the block layout, or counts it as priming.
+    private func takeFrame() throws {
+        let frames = Int(frame.pointee.nb_samples)
+        let offset = inputFrames
+        inputFrames += Int64(frames)
+        guard frames > 0 else { return }
+        if priming > 0 {
+            priming -= 1
+            return
+        }
+        guard frame.pointee.sample_rate == Int32(ObjectAudioRendering.sampleRate) else {
+            throw DecoderError(message: "\(frame.pointee.sample_rate) Hz frame")
+        }
+        let samples = UnsafeMutablePointer<Float>.allocate(capacity: frames * Self.channels.count)
+        samples.initialize(repeating: 0, count: frames * Self.channels.count)
+        var layout = frame.pointee.ch_layout
+        for index in 0..<Int(layout.nb_channels) {
+            let channel = av_channel_layout_channel_from_index(&layout, UInt32(index))
+            guard let slot = Self.channels.firstIndex(where: { $0.0 == channel }) else {
+                samples.deallocate()
+                throw DecoderError(message: "channel \(channel.rawValue) outside DTS:X's 7.1.4")
+            }
+            guard let source = frame.pointee.extended_data[index] else { continue }
+            let target = samples + slot * frames
+            switch AVSampleFormat(rawValue: frame.pointee.format) {
+            case AV_SAMPLE_FMT_S32P:
+                let input = UnsafeRawPointer(source).assumingMemoryBound(to: Int32.self)
+                for n in 0..<frames { target[n] = Float(input[n]) * (1.0 / 2_147_483_648.0) }
+            case AV_SAMPLE_FMT_S16P:
+                let input = UnsafeRawPointer(source).assumingMemoryBound(to: Int16.self)
+                for n in 0..<frames { target[n] = Float(input[n]) * (1.0 / 32_768.0) }
+            case AV_SAMPLE_FMT_FLTP:
+                target.update(from: UnsafeRawPointer(source).assumingMemoryBound(to: Float.self), count: frames)
+            default:
+                samples.deallocate()
+                throw DecoderError(message: "sample format \(frame.pointee.format)")
+            }
+        }
+        pending.append(Pending(samples: samples, frameCount: frames, inputFrameOffset: offset,
+                               isDiscontinuity: discontinuity,
+                               foldGain: Self.foldGain(presentation: presentation) ?? Self.standardFoldGain))
+        discontinuity = false
+    }
+
+    private func carries(_ channel: AVChannel) -> Bool {
+        var layout = frame.pointee.ch_layout
+        return av_channel_layout_index_from_channel(&layout, channel) >= 0
+    }
+
+    /// The presentation the decoder's last heights came from (`x_presentation`). An FFmpegBuild before
+    /// the option decodes the standard presentation's heights only.
+    private var presentation: Int64 {
+        var value: Int64 = 1
+        return av_opt_get_int(context.pointee.priv_data, "x_presentation", 0, &value) >= 0 ? value : 1
+    }
+
+    /// Why a decoded frame without heights is not rendered, from FFmpeg's profile.
+    private var presentationText: String {
+        switch context.pointee.profile {
+        case AV_PROFILE_DTS_HD_MA_X_IMAX:
+            return "DTS:X in an alternate presentation without heights, which plays as its 7.1 bed"
+        case AV_PROFILE_DTS_HD_MA_X:
+            return "DTS:X whose heights did not decode"
+        default:
+            return "no DTS:X extension in the standard presentation, \(frame.pointee.ch_layout.nb_channels) channels"
+        }
+    }
+
+    private func releaseLent() {
+        lent?.deallocate()
+        lent = nil
+    }
+
+    private func dropPending() {
+        releaseLent()
+        for block in pending { block.samples.deallocate() }
+        pending.removeAll()
+    }
+
+    // MARK: - Mapping
+
     /// A channel's element: its speaker's position, playing at unity.
-    static func state(for element: DTSXElement) -> ObjectAudioElementState {
-        let p = element.position
-        return ObjectAudioElementState(
-            position: SIMD3(p.0, p.1, max(0, p.2)),
-            gain: element.flags & DTSX_ELEMENT_ACTIVE != 0 ? element.gain : 0)
+    static func state(for role: ObjectAudioRole) -> ObjectAudioElementState {
+        if case .bed(let speaker) = role { return ObjectAudioElementState(position: speaker.position, gain: 1) }
+        return ObjectAudioElementState(gain: 1)
     }
 }
 #endif

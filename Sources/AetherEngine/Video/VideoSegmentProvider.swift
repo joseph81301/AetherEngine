@@ -36,6 +36,12 @@ struct LiveWindowSizing {
     /// AE#443: the session's disk allowance (`HLSVideoEngine.sessionRetentionBudgetBytes`). 0 means
     /// "not stated", which leaves the sizing purely time-based, as it was.
     var retentionBudgetBytes: Int = 0
+    /// `LoadOptions.liveEdgeCushionSeconds`, already validated (`LiveEdgePolicy.edgeCushion`). The
+    /// window holds at least this plus `edgeCushionWindowMarginSeconds`, so the playhead it parks that
+    /// far back never sits at the segment the next slide evicts.
+    var edgeCushionSeconds: Double? = nil
+
+    static let edgeCushionWindowMarginSeconds: Double = 15
 
     /// Number of segments the playlist keeps visible (and the cache keeps
     /// resident). Clamped up to `minSafeSegments`.
@@ -58,7 +64,8 @@ struct LiveWindowSizing {
     /// has to: comparing the served count against a value that already carries the clamps would report
     /// every clamped window as unclamped.
     func requestedSegmentCount(observedSegmentDurationSeconds: Double?) -> Int {
-        let effective = Self.effectiveWindowSeconds(dvrWindowSeconds)
+        let effective = max(Self.effectiveWindowSeconds(dvrWindowSeconds),
+                            edgeCushionSeconds.map { $0 + Self.edgeCushionWindowMarginSeconds } ?? 0)
         let divisor = max(max(0.5, targetSegmentDurationSeconds), observedSegmentDurationSeconds ?? 0)
         return Int(ceil(effective / divisor))
     }
@@ -478,6 +485,32 @@ enum LiveEdgePolicy {
     /// RFC 8216bis floor for `EXT-X-SERVER-CONTROL:HOLD-BACK`.
     static func holdBackSeconds(targetDuration: Int) -> Double { Double(3 * targetDuration) }
 
+    /// The holdback a session serves and builds its first window to: the RFC floor above, raised to a
+    /// host's `liveEdgeCushionSeconds` when that is deeper. Never below the floor, so a cushion cannot
+    /// buy back the stall-danger zone AE#189 closed.
+    static func holdBackSeconds(targetDuration: Int, edgeCushionSeconds: Double?) -> Double {
+        max(holdBackSeconds(targetDuration: targetDuration), edgeCushionSeconds ?? 0)
+    }
+
+    /// Ceiling on `LoadOptions.liveEdgeCushionSeconds`: the software join lead's own bound
+    /// (`SoftwareLiveHoldback.maximumLeadSeconds`), and with the window margin it still fits the
+    /// 60 s live-only window.
+    static let maximumEdgeCushionSeconds: Double = 45
+
+    /// `LoadOptions.liveEdgeCushionSeconds` as the engine uses it: nil unless finite and positive,
+    /// clamped to `maximumEdgeCushionSeconds`.
+    static func edgeCushion(_ requested: Double?) -> Double? {
+        guard let requested, requested.isFinite, requested > 0 else { return nil }
+        return min(requested, maximumEdgeCushionSeconds)
+    }
+
+    /// How long the first live manifest may be held. The historical 30 s, extended for a cushion a
+    /// strict-realtime origin can only fill at 1x, so a deep cushion is not cut short by the deadline
+    /// it was asked to wait for.
+    static func firstServeTimeoutSeconds(edgeCushionSeconds: Double?) -> TimeInterval {
+        max(30, (edgeCushionSeconds ?? 0) + 15)
+    }
+
     /// One observed segment duration gives a strict-realtime fastZap source one more chance to fill
     /// naturally, while the clamp keeps the startup bound useful for unusually short or long GOPs.
     static func fastZapDegradedGraceSeconds(
@@ -500,7 +533,8 @@ enum LiveEdgePolicy {
                                         cutTargetSeconds: Double?,
                                         cadenceFloorSeconds: Double?,
                                         segmentsAreCutHere: Bool = false,
-                                        windowSegmentCount: Int) -> Bool {
+                                        windowSegmentCount: Int,
+                                        edgeCushionSeconds: Double? = nil) -> Bool {
         let td = targetDurationSeconds(maxSegmentDuration: maxSegmentDuration,
                                        cutTargetSeconds: cutTargetSeconds,
                                        cadenceFloorSeconds: cadenceFloorSeconds,
@@ -509,14 +543,16 @@ enum LiveEdgePolicy {
             segmentCount: segmentCount,
             summedDurationSeconds: summedDurationSeconds,
             targetDuration: td,
-            windowSegmentCount: windowSegmentCount
+            windowSegmentCount: windowSegmentCount,
+            edgeCushionSeconds: edgeCushionSeconds
         )
     }
 
     static func startupCushionSatisfied(segmentCount: Int,
                                         summedDurationSeconds: Double,
                                         targetDuration: Int,
-                                        windowSegmentCount: Int) -> Bool {
+                                        windowSegmentCount: Int,
+                                        edgeCushionSeconds: Double? = nil) -> Bool {
         guard segmentCount >= minStartupSegments else { return false }
         if segmentCount >= windowSegmentCount { return true }
         // Judged at the served resolution too, or the depth check disagrees with the value it is checking
@@ -524,7 +560,8 @@ enum LiveEdgePolicy {
         // 6.0 for some first-segment starts and to a hair under it for others (a first start of 0.030 s
         // lands short, the reporter's 0.060 s does not), and the gate would then hold for a fourth
         // segment it does not need, a full extra segment duration, on some sessions and not others.
-        return servedSeconds(summedDurationSeconds) >= holdBackSeconds(targetDuration: targetDuration)
+        return servedSeconds(summedDurationSeconds)
+            >= holdBackSeconds(targetDuration: targetDuration, edgeCushionSeconds: edgeCushionSeconds)
     }
 
     /// AE#374: the first live manifest's own account of what it cost, for the log.
@@ -537,8 +574,9 @@ enum LiveEdgePolicy {
     static func firstServeAccount(waitedSeconds: TimeInterval,
                                   segmentCount: Int,
                                   summedDurationSeconds: Double,
-                                  targetDuration: Int) -> String {
-        let holdBack = holdBackSeconds(targetDuration: targetDuration)
+                                  targetDuration: Int,
+                                  edgeCushionSeconds: Double? = nil) -> String {
+        let holdBack = holdBackSeconds(targetDuration: targetDuration, edgeCushionSeconds: edgeCushionSeconds)
         let reached = servedSeconds(summedDurationSeconds) >= holdBack ? ">=" : "<"
         return "first live manifest served after \(seconds(waitedSeconds))s: "
             + "\(segmentCount) segments / \(seconds(summedDurationSeconds))s "
@@ -737,7 +775,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private var liveWindowSizing: LiveWindowSizing {
         guard let limits = nativeLiveDVRPolicy?.snapshot else { return baseLiveWindowSizing }
         return LiveWindowSizing(targetSegmentDurationSeconds: baseLiveWindowSizing.targetSegmentDurationSeconds,
-                                dvrWindowSeconds: limits.windowSeconds, retentionBudgetBytes: limits.retentionBytes)
+                                dvrWindowSeconds: limits.windowSeconds, retentionBudgetBytes: limits.retentionBytes,
+                                edgeCushionSeconds: baseLiveWindowSizing.edgeCushionSeconds)
     }
 
     /// Reconcile playlist and cache off the caller's actor; this never rebuilds the source/player.
@@ -745,6 +784,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         guard isLive, nativeLiveDVRPolicy?.snapshot != nil else { return }
         cache.applyNativeLiveRetentionFloor(notePlaylistBuild().firstVisible)
     }
+    /// `LoadOptions.liveEdgeCushionSeconds`, carried by the window sizing that already holds room for it.
+    var liveEdgeCushionSeconds: Double? { baseLiveWindowSizing.edgeCushionSeconds }
     /// Only `.fastZap` sessions may serve a shallow first window after a bounded grace.
     private let allowsBoundedDegradedStart: Bool
     private let startupGraceSeconds: TimeInterval?
@@ -779,6 +820,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let supplementalCodecsString: String?
     private let resolution: (Int, Int)
     private let videoRange: HLSVideoRange
+    /// REQ-VIDEO-LAYOUT for a stereo session (`StereoVideoSignal.videoLayout`); nil for 2D.
+    private let videoLayout: String?
     private let frameRate: Double?
     private let hdcpLevel: String?
     private let sourceBitrate: Int64
@@ -834,6 +877,30 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// on a front that is provably frozen. nil/false during a coalesced restart (no producer
     /// installed) keeps the normal wait+ride paths.
     private let producerFinished: (() -> Bool)?
+    /// Bytes this session pulled from the source, for the throughput fallback of the march-rate
+    /// estimate (`HLSVideoEngine.demuxerBytesFetched`).
+    private let sourceBytesFetched: (() -> Int64)?
+    /// A forward jump inside the wait window waits for the march only while the measured march gets
+    /// there sooner than a restart would. Off = the fixed-window rule alone.
+    private let decidesForwardWaitByMarchRate: Bool
+    /// How long a restart decision for a burst press waits for a newer target before it fires, so the
+    /// presses after the first restart once, at the last one. Longer than a remote's repeat gap.
+    /// Read per press, so a test can hold the earlier presses of a burst without a deadline and
+    /// settle only the last one. Guarded by stateLock.
+    private var _marchRateSettleSeconds: TimeInterval
+    /// A jump this soon after a jump to another index is a burst press, and only such a jump settles.
+    /// A lone jump restarts at once: settling every restart cost 0.4 to 0.9 s per +10 min seek.
+    private let marchRateBurstWindowSeconds: TimeInterval
+    /// The last jump request seen (index, uptime seconds). Guarded by stateLock.
+    private var _lastJump: (index: Int, time: Double)?
+    /// Segment completions of the active and previous producers. Guarded by stateLock.
+    private var _marchTracker = MarchRateTracker()
+    /// Seconds from the last provider-fired restart to its target's first bytes. Guarded by stateLock.
+    private var _lastRestartCostSeconds: Double?
+    /// The declared target the current one replaced. Recorded where the target changes, because the
+    /// loopback server asks `mediaSegmentURL` first and that already declares it: read in
+    /// `serveSource`, the cache's target is the request itself. Guarded by stateLock.
+    private var _targetBeforeChange: Int = -1
 
     /// AE#169 round 2: single-slot record of the last forward-window fetch that burned its FULL
     /// backpressure wait. Same index + unmoved march front on the next fetch is proof the march is
@@ -975,6 +1042,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#443: the window-clamp line is a statement about the session, so it is made once.
     private var _loggedLiveWindowClamp = false
     private static let liveRecentDurationSampleCount = 20
+    /// AE#936: where the cutter is reading inside the open live segment. Guarded by stateLock.
+    private var _liveReadHead = LiveReadHead()
     /// One-shot latch for `noteWindowSlideRelativeToConsumer`. Guarded by stateLock.
     private var _liveConsumerOutsideWindowLatched = false
 
@@ -996,6 +1065,15 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// with the cushion down to one entry there is no longer a second entry to mask it.
     /// Guarded by stateLock.
     private var _seqAdvertisableCount = 0
+    /// AE#958: the advertised media and its longest entry, so the startup gate can compare what the
+    /// first playlist carries with the TARGETDURATION AVPlayer waits before its first reload, and
+    /// the moment the first entry became advertisable, which starts the comfort budget.
+    /// Guarded by stateLock.
+    private var _seqAdvertisedSeconds: Double = 0
+    private var _seqLongestAdvertised: Double = 0
+    private var _seqFirstAdvertisedAt: Date?
+    /// `sequentialStartupComfortSeconds` for this provider; tests shorten it.
+    var sequentialStartupComfort: TimeInterval = VideoSegmentProvider.sequentialStartupComfortSeconds
 
     /// #370: never hold the first media playlist for more than ONE published duration. The live
     /// constant this gate reused (`LiveEdgePolicy.minStartupSegments = 2`) guards a SLIDING window
@@ -1006,6 +1084,21 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// possibly-stalling origin. The field session held AVPlayer's playlist GET for the full 30 s
     /// and the asset load timed out (-12884) with ~12 s of media already on disk.
     static let sequentialStartupSegments = 1
+
+    /// AE#958: one entry is enough to release, but not enough to play through. AVPlayer reloads an
+    /// EVENT playlist one TARGETDURATION after the first read, and a first playlist whose single
+    /// entry is shorter than that runs dry before the reload (device: `restarting 5.68s from end of
+    /// live playlist; target duration 6s`, then a 0.1 s `playbackStalled` at t+6.05). So the gate
+    /// holds for more media than one reload interval, but only this long past the first entry: a
+    /// fast archive cuts the second segment well inside it, a stalling one (#370) pays at most this.
+    static let sequentialStartupComfortSeconds: TimeInterval = 2.0
+
+    /// Whether the advertised media outlasts AVPlayer's first reload interval.
+    static func sequentialStartupCoversFirstReload(advertisedSeconds: Double, longestSegment: Double) -> Bool {
+        let target = LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: longestSegment,
+                                                          cutTargetSeconds: nil, cadenceFloorSeconds: nil)
+        return advertisedSeconds > Double(target)
+    }
 
     init(
         cache: SegmentCache,
@@ -1022,6 +1115,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         audioLanguage: String? = nil,
         audioChannelCount: Int? = nil,
         audioIsAtmosStreamCopy: Bool = false,
+        videoLayout: String? = nil,
         isLive: Bool = false,
         servesSegmentsProgressively: Bool = false,
         sequentialAppendPlaylist: Bool = false,
@@ -1039,6 +1133,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         restartActivity: (() -> Bool)? = nil,
         activeProducerBase: (() -> Int?)? = nil,
         producerFinished: (() -> Bool)? = nil,
+        sourceBytesFetched: (() -> Int64)? = nil,
+        decidesForwardWaitByMarchRate: Bool = true,
+        marchRateSettleSeconds: TimeInterval = 0.7,
+        marchRateBurstWindowSeconds: TimeInterval = 1.5,
         initialRestartIndex: Int = 0,
         repositionWaitSlice: TimeInterval = 8.0,
         sparseHoleWaitSlice: TimeInterval = 2.0,
@@ -1085,11 +1183,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.audioLanguage = audioLanguage
         self.audioChannelCount = audioChannelCount
         self.audioIsAtmosStreamCopy = audioIsAtmosStreamCopy
+        self.videoLayout = videoLayout
         self.restartHandler = restartHandler
         self.unrecoverableGapHandler = unrecoverableGapHandler
         self.restartActivity = restartActivity
         self.activeProducerBase = activeProducerBase
         self.producerFinished = producerFinished
+        self.sourceBytesFetched = sourceBytesFetched
+        self.decidesForwardWaitByMarchRate = decidesForwardWaitByMarchRate
+        self._marchRateSettleSeconds = marchRateSettleSeconds
+        self.marchRateBurstWindowSeconds = marchRateBurstWindowSeconds
         self._lastRestartIndex = initialRestartIndex
         self.repositionWaitSlice = repositionWaitSlice
         self.sparseHoleWaitSlice = sparseHoleWaitSlice
@@ -1105,6 +1208,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.currentShiftSeconds = currentShiftSeconds
         self.segmentPlacedHandler = segmentPlacedHandler
         self.segmentServedHandler = segmentServedHandler
+        if !isLive, decidesForwardWaitByMarchRate {
+            cache.setStoreObserver { [weak self] index, bytes, parked in
+                self?.recordMarchStore(index: index, bytes: bytes, parkedBefore: parked)
+            }
+        }
     }
 
     /// AE#684: where a live segment's sound begins and ends on the output axis, by segment index.
@@ -1203,11 +1311,72 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // playlist renderer omits those entries. Negative values are producer bugs, clamp them.
         let clamped = max(0, durationSeconds)
         _seqDurations.append(clamped)
-        if clamped > 0 { _seqAdvertisableCount += 1 }
+        if clamped > 0 {
+            _seqAdvertisableCount += 1
+            _seqAdvertisedSeconds += clamped
+            _seqLongestAdvertised = max(_seqLongestAdvertised, clamped)
+            if _seqFirstAdvertisedAt == nil { _seqFirstAdvertisedAt = Date() }
+        }
         stateLock.unlock()
         firstSegmentCondition.lock()
         firstSegmentCondition.broadcast()
         firstSegmentCondition.unlock()
+    }
+
+    /// AE#958: the resident spans of a sequential session on the item axis its append playlist builds,
+    /// from the muxed durations instead of the static plan the cutter drifts from. A zero-duration
+    /// entry has no URI and no cache entry, so it joins its neighbours rather than splitting the span,
+    /// and a segment whose duration is not final yet is not in the playlist, so it is not seekable.
+    /// nil off the sequential path.
+    func sequentialResidentItemRanges(residentIndexes: [ClosedRange<Int>]) -> [ClosedRange<Double>]? {
+        guard sequentialAppendPlaylist else { return nil }
+        stateLock.lock()
+        let durations = _seqDurations
+        stateLock.unlock()
+        return Self.itemRanges(durations: durations, residentIndexes: residentIndexes)
+    }
+
+    /// AE#958: the segment covering playlist time `t` on a sequential session, from the muxed
+    /// durations. nil off the sequential path and past the finalized end, where the caller's plan
+    /// is the only estimate there is.
+    func sequentialSegmentIndex(forPlaylistTime t: Double) -> Int? {
+        guard sequentialAppendPlaylist else { return nil }
+        stateLock.lock()
+        let durations = _seqDurations
+        stateLock.unlock()
+        return Self.sequentialSegmentIndex(forPlaylistTime: t, durations: durations)
+    }
+
+    /// Zero-duration entries are plan indices a long GOP skipped; they hold no time and are never
+    /// the answer.
+    static func sequentialSegmentIndex(forPlaylistTime t: Double, durations: [Double]) -> Int? {
+        var cursor = 0.0
+        for (index, duration) in durations.enumerated() where duration > 0 {
+            cursor += duration
+            if max(t, 0) < cursor { return index }
+        }
+        return nil
+    }
+
+    static func itemRanges(durations: [Double], residentIndexes: [ClosedRange<Int>]) -> [ClosedRange<Double>] {
+        let resident = residentIndexes.reduce(into: IndexSet()) { set, range in
+            set.insert(integersIn: range.lowerBound...range.upperBound)
+        }
+        var ranges: [ClosedRange<Double>] = []
+        var runStart: Double?
+        var cursor = 0.0
+        for (index, duration) in durations.enumerated() {
+            if duration <= 0 { continue }
+            if resident.contains(index) {
+                if runStart == nil { runStart = cursor }
+            } else if let start = runStart {
+                ranges.append(start...cursor)
+                runStart = nil
+            }
+            cursor += duration
+        }
+        if let start = runStart { ranges.append(start...cursor) }
+        return ranges
     }
 
     /// Producer reached true source EOF: the next playlist build renders as a completed VOD
@@ -1224,7 +1393,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// Hold the first media playlist until the startup segment exists (mirrors the live gate:
     /// an empty playlist is a broken asset to AVPlayer, which never re-polls it). A fast
-    /// archive origin cuts the first segments within a second.
+    /// archive origin cuts the first segments within a second. With one entry advertised, hold
+    /// on for media past the first reload interval, up to `sequentialStartupComfort`.
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool {
         let deadline = Date(timeIntervalSinceNow: timeout)
         firstSegmentCondition.lock()
@@ -1233,12 +1403,20 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         defer { parkedWaiters -= 1 }
         while true {
             stateLock.lock()
-            let ready = _seqAdvertisableCount >= Self.sequentialStartupSegments || _seqEnded
+            let released = _seqAdvertisableCount >= Self.sequentialStartupSegments
+            let covered = Self.sequentialStartupCoversFirstReload(advertisedSeconds: _seqAdvertisedSeconds,
+                                                                  longestSegment: _seqLongestAdvertised)
+            let comfortEnd = _seqFirstAdvertisedAt?.addingTimeInterval(sequentialStartupComfort)
+            let ended = _seqEnded
             let aborted = _seqStartupAborted
             stateLock.unlock()
-            if ready { return true }
+            if ended || (released && covered) { return true }
             if aborted { return false }
-            if !firstSegmentCondition.wait(until: deadline) { return false }
+            if released, let comfortEnd, Date() >= comfortEnd { return true }
+            let wake = released ? min(deadline, comfortEnd ?? deadline) : deadline
+            if !firstSegmentCondition.wait(until: wake) {
+                if Date() >= deadline { return released }
+            }
         }
     }
 
@@ -1619,6 +1797,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         let previousTarget = cache.targetIndex
         cache.declareTarget(index)
+        if previousTarget != index {
+            stateLock.lock()
+            _targetBeforeChange = previousTarget
+            stateLock.unlock()
+        }
 
         // AE#418: AVPlayer places this segment at the position the PLAYLIST gives it, read through
         // the axis its timeline already carries (measured with `play --picture-probe`). So a segment
@@ -1797,13 +1980,31 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // AE#169 round 2: true when the fetch takes the VOD forward-window backpressure wait, so a
         // full-timeout miss records (index, front) for the frozen-march escalation above.
         var tookForwardWait = false
+        // A second escalation beside #169's `marchProvenDead`, with the same veto bypass below: the
+        // march is alive but slower than a restart (`marchRateDecision`).
+        let waitWindow = Self.forwardWaitWindow
+        var marchTooSlow = false
         if staleBelowProducer || producerPassedAndPruned {
             needsRestart = true
         } else if let r = range {
             if index < r.0 {
                 needsRestart = true
-            } else if index > r.1 + Self.forwardWaitWindow {
+            } else if index > r.1 + waitWindow {
                 needsRestart = true
+                // r.1 is the highest SEALED segment, which right after a restart still belongs to
+                // the producer before; the veto below reads the ACTIVE producer's base instead. A
+                // request inside the active march's window therefore got neither the restart (vetoed)
+                // nor a march-rate decision, and rode the march (Apple TV, 70 Mbps link: 20.5 s in a remote burst).
+                let front = activeMarchFront
+                if !isLive, decidesForwardWaitByMarchRate {
+                    let decision = index <= front + waitWindow
+                        ? marchRateDecision(index: index, front: front, branch: "b")
+                        : settleRestartPastWindow(index: index, branch: "b")
+                    if let served = decision.served {
+                        return logServed(index: index, source: served, totalStart: totalStart, restarted: false)
+                    }
+                    marchTooSlow = decision.restart
+                }
             } else if index >= r.0 && index <= r.1 {
                 // min...max is not proof of residency: retained scrub bands leave interior holes.
                 // Only wait when the active producer can actually march into this index.
@@ -1851,7 +2052,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                         )
                     }
                 }
-                needsRestart = index > front + Self.forwardWaitWindow || marchProvenDead
+                if !isLive, decidesForwardWaitByMarchRate, !marchProvenDead {
+                    let decision = index <= front + waitWindow
+                        ? marchRateDecision(index: index, front: front, branch: "c")
+                        : settleRestartPastWindow(index: index, branch: "c")
+                    if let served = decision.served {
+                        return logServed(index: index, source: served, totalStart: totalStart, restarted: false)
+                    }
+                    marchTooSlow = decision.restart
+                }
+                needsRestart = index > front + waitWindow || marchProvenDead || marchTooSlow
             }
         } else {
             // Empty cache: cold start (producer at lastRestartIndex, hasn't written yet) vs. big scrub
@@ -1870,6 +2080,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             let rideDeadline = DispatchTime.now() + repositionRideCapSeconds
             var attempt = 0
             var firedThisCall = false
+            var firedAt: DispatchTime?
             while attempt < Self.repositionMaxWaits {
                 if restartActivity?() == true {
                     if DispatchTime.now() > rideDeadline {
@@ -1888,7 +2099,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     // AE#169 round 2: a march proven dead (finished pump / frozen front across a
                     // full wait) must not veto the fire; the still-installed dead producer's base
                     // covering the index is exactly the wedge being escaped.
-                    let producerCovers = !marchProvenDead && activeProducerCovers(index)
+                    let producerCovers = !marchProvenDead && !marchTooSlow && activeProducerCovers(index)
                     // A request superseded by a NEWER declared target is an orphan of a skip
                     // storm: AVPlayer's newest request is what it actually wants (the same
                     // newest-wins semantics the coalescer applies to immediate restarts).
@@ -1908,6 +2119,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                         )
                         lastRestartIndex = index
                         clearForwardWaitMiss()
+                        firedAt = DispatchTime.now()
                         restart(index)
                         // Reset highWater AFTER restart() returns (synchronous: old producer has exited).
                         // Pre-restart reset would be clobbered by the old producer's final write re-bumping
@@ -1919,6 +2131,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 }
                 if let source = cache.fetchSource(index: index, timeout: repositionWaitSlice,
                                                   progressive: fetchesProgressively) {
+                    if let firedAt {
+                        let cost = Double(DispatchTime.now().uptimeNanoseconds - firedAt.uptimeNanoseconds) / 1e9
+                        stateLock.lock()
+                        _lastRestartCostSeconds = cost
+                        stateLock.unlock()
+                    }
                     return logServed(index: index, source: source, totalStart: totalStart, restarted: true)
                 }
                 // Audit SEG-3: a closed cache answers fetch at once, so riding a restart that
@@ -1965,6 +2183,138 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         _forwardMissIndex = .min
         _forwardMissFront = .min
         stateLock.unlock()
+    }
+
+    // MARK: - Forward wait by march rate
+
+    /// Restart budget before a restart cost has been measured in this session.
+    static let marchRateDefaultBudgetSeconds = 3.0
+
+    func setMarchRateSettleSecondsForTesting(_ seconds: TimeInterval) {
+        stateLock.lock(); _marchRateSettleSeconds = seconds; stateLock.unlock()
+    }
+
+    /// `time` is uptime seconds; tests pass their own to shape a march without sleeping.
+    func recordMarchStore(index: Int, bytes: Int, parkedBefore: Bool = false, time: Double? = nil) {
+        let now = time ?? Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        let source = sourceBytesFetched?()
+        stateLock.lock()
+        _marchTracker.record(index: index, time: now, bytes: bytes, sourceBytes: source, parkedBefore: parkedBefore)
+        stateLock.unlock()
+    }
+
+    /// Pure decision: seconds until the march starts writing `index` (it is writing `writingIndex`
+    /// now, `secondsSinceLastStore` into it) against what a restart costs. Waiting wins only when the
+    /// march gets there first; a restart lands on any distance for about the same price.
+    static func marchRateRestarts(distance: Int, rate: Double, secondsSinceLastStore: Double,
+                                  budgetSeconds: Double) -> (restart: Bool, eta: Double) {
+        guard rate > 0 else { return (false, 0) }
+        let eta = Swift.max(0, Double(Swift.max(0, distance)) / rate - secondsSinceLastStore)
+        return (eta > budgetSeconds, eta)
+    }
+
+    /// The march-rate decision; a restart for a burst press is first held for `_marchRateSettleSeconds`. The
+    /// segment arriving meanwhile is served; a newer target arriving meanwhile cancels the restart, so
+    /// a burst of presses fires once, for the press that stayed the newest.
+    private func marchRateDecision(index: Int, front: Int, branch: String)
+        -> (restart: Bool, served: SegmentSource?) {
+        guard marchTooSlowForJump(index: index, front: front, branch: branch) else { return (false, nil) }
+        return settleRestart(index: index, branch: branch)
+    }
+
+    /// A jump past the window restarts as soon as it is asked for, so a burst whose presses land
+    /// beyond it restarted at every press. A burst press settles here too.
+    /// `restart` is only the veto bypass, which such a fetch does not need, so it stays false.
+    private func settleRestartPastWindow(index: Int, branch: String) -> (restart: Bool, served: SegmentSource?) {
+        guard cache.targetIndex == index, isForwardJump(index) else { return (false, nil) }
+        EngineLog.emit("[HLSVideoEngine] seg\(index): march-rate restart (past the window) branch=\(branch)", category: .session)
+        return (false, settleRestart(index: index, branch: branch).served)
+    }
+
+    private func settleRestart(index: Int, branch: String) -> (restart: Bool, served: SegmentSource?) {
+        // Only a press inside a burst settles: a jump to another index within the burst window of the
+        // one before. A re-request of the same index (AVPlayer retrying) is not a new press.
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        stateLock.lock()
+        let previous = _lastJump
+        if previous?.index != index { _lastJump = (index, now) }
+        let settle = _marchRateSettleSeconds
+        stateLock.unlock()
+        guard let previous, previous.index != index, now - previous.time <= marchRateBurstWindowSeconds else {
+            return (true, nil)
+        }
+        if let source = cache.fetchSource(index: index, timeout: settle,
+                                          progressive: fetchesProgressively, whileTarget: true) {
+            EngineLog.emit("[HLSVideoEngine] seg\(index): march-rate arrived while settling branch=\(branch)", category: .session)
+            return (false, source)
+        }
+        guard cache.targetIndex == index else {
+            EngineLog.emit(
+                "[HLSVideoEngine] seg\(index): march-rate superseded by seg\(cache.targetIndex) while settling branch=\(branch)",
+                category: .session)
+            return (false, nil)
+        }
+        return (true, nil)
+    }
+
+    private func isForwardJump(_ index: Int) -> Bool {
+        stateLock.lock()
+        let previousTarget = _targetBeforeChange
+        stateLock.unlock()
+        return previousTarget >= 0 && index > previousTarget + 1
+    }
+
+    private func marchTooSlowForJump(index: Int, front: Int, branch: String) -> Bool {
+        // Guards: the newest declared target, and a forward jump rather than the next segment of
+        // sequential playback (anything past the next one: a remote burst steps 2 to 3 segments at a
+        // time, which a wider guard read as playback). Anything else keeps the 7.50.0 wait.
+        guard cache.targetIndex == index else {
+            EngineLog.emit("[HLSVideoEngine] seg\(index): march-rate stock reason=not-latest-target branch=\(branch)",
+                           category: .session)
+            return false
+        }
+        guard isForwardJump(index) else {
+            stateLock.lock()
+            let previousTarget = _targetBeforeChange
+            stateLock.unlock()
+            EngineLog.emit(
+                "[HLSVideoEngine] seg\(index): march-rate stock reason=not-a-jump (prev=\(previousTarget) front=\(front)) "
+                + "branch=\(branch)",
+                category: .session)
+            return false
+        }
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        let highWater = cache.highestStoredIndex
+        let parkedSinceStore = cache.parkedSinceLastStore
+        let restartIndex = lastRestartIndex
+        stateLock.lock()
+        let estimate = _marchTracker.estimate(activeAnchor: restartIndex)
+        let lastStore = _marchTracker.lastSample
+        let budget = _lastRestartCostSeconds ?? Self.marchRateDefaultBudgetSeconds
+        stateLock.unlock()
+        guard let estimate else {
+            EngineLog.emit(
+                "[HLSVideoEngine] seg\(index): march-rate stock reason=no-measurement (front=\(front)) branch=\(branch)",
+                category: .session)
+            return false
+        }
+        // Before the active producer's first write it is writing its anchor; after, the next index.
+        let writing = highWater >= restartIndex ? highWater + 1 : restartIndex
+        // A producer parked since its last store has not been writing (a full window, a paused consumer):
+        // the jump just released it, so it starts on the segment now.
+        let sinceStore = parkedSinceStore ? 0 : lastStore.map { $0.index == writing - 1 ? now - $0.time : 0 } ?? 0
+        let decision = Self.marchRateRestarts(
+            distance: index - writing, rate: estimate.rate,
+            secondsSinceLastStore: sinceStore, budgetSeconds: budget)
+        EngineLog.emit(
+            "[HLSVideoEngine] seg\(index): march-rate \(decision.restart ? "restart" : "wait") "
+            + "(front=\(front) writing=\(writing) d=\(index - front) "
+            + "rate=\(String(format: "%.3f", estimate.rate))/s src=\(estimate.source.rawValue) "
+            + "eta=\(String(format: "%.1f", decision.eta))s budget=\(String(format: "%.2f", budget))s) "
+            + "branch=\(branch)",
+            category: .session
+        )
+        return decision.restart
     }
 
     private func logServed(index: Int, source: SegmentSource?, totalStart: DispatchTime,
@@ -2736,8 +3086,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     }
 
     /// Only completed, independently decodable media participates. The optional duration threshold
-    /// never cuts a GOP early or weakens the standard/full-holdback path.
+    /// never cuts a GOP early or weakens the standard/full-holdback path. A host cushion is a request to
+    /// start further back, so a shallow window qualifies only once it already holds the cushion: the
+    /// join lands at the head of that window, which is then at least the cushion behind the edge. A
+    /// cushion used to bar the bounded start outright, and a 2.5 s one on a 10 s GOP (holdback 30 s)
+    /// held every join for a third segment it did not need.
     private func hasBoundedStartupMedia(_ snapshot: (count: Int, summed: Double, maxDuration: Double)) -> Bool {
+        if let cushion = liveEdgeCushionSeconds,
+           !(LiveEdgePolicy.servedSeconds(snapshot.summed) >= cushion) { return false }
         if snapshot.count >= LiveEdgePolicy.minStartupSegments { return true }
         guard snapshot.count == 1, let minimum = singleSegmentStartupMinimumSeconds else { return false }
         return snapshot.summed.isFinite && snapshot.summed >= minimum
@@ -2769,7 +3125,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 didLogStartupPolicy = true
                 let grace = startupGraceSeconds.map(LiveEdgePolicy.seconds) ?? "auto"
                 let single = singleSegmentStartupMinimumSeconds.map(LiveEdgePolicy.seconds) ?? "off"
-                EngineLog.emit("[HLSVideoEngine] live startup policy: bounded=\(allowsBoundedDegradedStart) grace=\(grace) singleSegmentMinimum=\(single) holdbackFloor=\(boundedStartFloorsAtHoldback)", category: .session)
+                let cushion = liveEdgeCushionSeconds.map(LiveEdgePolicy.seconds) ?? "off"
+                EngineLog.emit("[HLSVideoEngine] live startup policy: bounded=\(allowsBoundedDegradedStart) grace=\(grace) singleSegmentMinimum=\(single) holdbackFloor=\(boundedStartFloorsAtHoldback) edgeCushion=\(cushion)", category: .session)
             }
             // AE#684 latched ingest sessions; AE#686 extends it to a source the engine cuts itself,
             // where the second grace bought nothing on device but a session 1 s further from the edge.
@@ -2784,7 +3141,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             if LiveEdgePolicy.startupCushionSatisfied(segmentCount: snap.count,
                                                        summedDurationSeconds: snap.summed,
                                                        targetDuration: target.value,
-                                                       windowSegmentCount: window) {
+                                                       windowSegmentCount: window,
+                                                       edgeCushionSeconds: liveEdgeCushionSeconds) {
                 let sealed = sealLiveTargetDuration(target)
                 accountForFirstServe(since: enteredAt, snapshot: snap, targetDuration: sealed)
                 return true
@@ -2799,7 +3157,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 degradedGrace = grace
                 degradedDeadline = Date().addingTimeInterval(grace)
             }
+            // AE#936: after a burst on a long GOP the next keyframe is further off than the grace, so
+            // waiting it out serves the same window later.
+            if let degradedDeadline, let degradedGrace,
+               hasBoundedStartupMedia(snap),
+               fastZapGraceIsFutile(remainingSeconds: degradedDeadline.timeIntervalSinceNow) {
+                let sealed = sealLiveTargetDuration(target)
+                let spentGrace = degradedGrace - max(0, degradedDeadline.timeIntervalSinceNow)
+                accountForFirstServe(
+                    since: enteredAt, snapshot: snap, targetDuration: sealed,
+                    note: "fastZap bounded start, \(LiveEdgePolicy.seconds(degradedGrace))s grace ended after "
+                        + "\(LiveEdgePolicy.seconds(spentGrace))s: next keyframe out of reach"
+                )
+                return true
+            }
             var effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
+            if degradedDeadline != nil {
+                effectiveDeadline = min(effectiveDeadline, Date().addingTimeInterval(Self.graceReadHeadPollSeconds))
+            }
             // AE#684: a join becomes spent when the cutter parks on an empty reader, which is no
             // event this condition hears. While that is still to come, look again shortly.
             if spent == false {
@@ -2814,7 +3189,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 if LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
                                                           summedDurationSeconds: after.summed,
                                                           targetDuration: afterTarget.value,
-                                                          windowSegmentCount: window) {
+                                                          windowSegmentCount: window,
+                                                          edgeCushionSeconds: liveEdgeCushionSeconds) {
                     let sealed = sealLiveTargetDuration(afterTarget)
                     accountForFirstServe(since: enteredAt, snapshot: after, targetDuration: sealed)
                     return true
@@ -2857,6 +3233,36 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// How often the gate asks an ingest whether its join is spent. Well under a frame of start latency.
     static let joinSpentPollSeconds: TimeInterval = 0.025
+    /// AE#936: how often a running fastZap grace re-reads the read head, which signals no condition.
+    static let graceReadHeadPollSeconds: TimeInterval = 0.05
+
+    /// AE#936: the cutter read a video packet at `ptsSeconds` (the axis `appendLiveSegment` starts use).
+    func noteLiveReadHead(ptsSeconds: Double) {
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        stateLock.lock()
+        _liveReadHead.note(ptsSeconds: ptsSeconds, at: now)
+        stateLock.unlock()
+    }
+
+    /// AE#936: whether the rest of a running fastZap grace can still finalize a segment.
+    private func fastZapGraceIsFutile(remainingSeconds: TimeInterval) -> Bool {
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let last = segments.last,
+              let head = _liveReadHead.latestPtsSeconds,
+              let shortest = segments.map(\.durationSeconds).min() else { return false }
+        return LiveEdgePolicy.fastZapGraceIsFutile(
+            openSegmentSeconds: head - (last.startSeconds + last.durationSeconds),
+            shortestSegmentSeconds: shortest,
+            deliveryRate: _liveReadHead.deliveryRate(
+                now: now,
+                window: LiveEdgePolicy.graceRateWindowSeconds,
+                minimumSpan: LiveEdgePolicy.graceRateMinimumSpanSeconds
+            ),
+            remainingGraceSeconds: remainingSeconds
+        )
+    }
 
     /// AE#374: one account per live session, emitted at whichever exit ends the first-serve gate.
     ///
@@ -2881,7 +3287,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             waitedSeconds: Self.secondsSince(entered),
             segmentCount: snapshot.count,
             summedDurationSeconds: snapshot.summed,
-            targetDuration: targetDuration
+            targetDuration: targetDuration,
+            edgeCushionSeconds: liveEdgeCushionSeconds
         )
         EngineLog.emit(
             "[HLSVideoEngine] \(warning ? "WARNING: " : "")\(account)"
@@ -2991,6 +3398,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return (resolution.0, resolution.1)
     }
     var masterVideoRange: HLSVideoRange? { videoRange }
+    var masterVideoLayout: String? { videoLayout }
     /// 25 Mbps fallback: under-declaring fires -12318 "Segment exceeds specified bandwidth" on every segment.
     var masterAverageBandwidth: Int? {
         sourceBitrate > 0 ? Int(sourceBitrate) : 25_000_000
@@ -3096,9 +3504,22 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // shape). AVKit fetches this VOD single-segment file ONCE and never re-fetches it, so it MUST be
             // complete. Wait for the reader's definitive EOF signal (isFinished) rather than a cue-count plateau
             // heuristic, which fired early during dialogue gaps and served a truncated file (device-confirmed).
-            let deadline = Date().addingTimeInterval(30.0)
-            while !store.isFinished, Date() < deadline {
-                usleep(100_000)
+            // AE#984: a load-declared sidecar's store is never waited on. Holding the request held AVPlayer's
+            // media loading with it, so a slow sidecar froze the picture; a 404 is retried every few seconds
+            // while A/V keeps loading, and a failed fill is answered at once. Reader-fed stores keep the wait.
+            switch store.wholeProgramServe {
+            case .retryLater:
+                EngineLog.emit("[HLSVideoEngine] AE#984: whole-program subtitle .vtt ord=\(ordinal) requested before "
+                               + "its sidecar is decoded; answering 404 so AVPlayer asks again", category: .hlsServer)
+                return nil
+            case .waitForReader:
+                let deadline = Date().addingTimeInterval(30.0)
+                while store.wholeProgramServe == .waitForReader, Date() < deadline {
+                    usleep(100_000)
+                }
+                if store.wholeProgramServe == .retryLater { return nil }
+            case .complete, .failedFill:
+                break
             }
             // Sodalite#32: the cues are stored at SOURCE pts; AVPlayer clock = source - shift. Apply the CURRENT
             // engine shift (read now, not the possibly-zero load-time value) so cues land on the video's axis.

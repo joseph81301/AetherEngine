@@ -456,6 +456,9 @@ final class LiveTelemetrySampler {
             rssMb: AetherEngine.residentMemoryMB()
         )
         engine.applyLiveTelemetry(snapshot)
+        engine.refreshNativeBufferedPosition()
+        engine.tickKeyframeStillLadder()
+        await engine.refreshSessionCacheStatus()
     }
 
     /// One line per tick on the native path (#93 post-recovery lag diagnosis). Discriminates

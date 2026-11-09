@@ -4,7 +4,7 @@ import AVFoundation
 @testable import AetherEngine
 
 @Suite("AE#711 follow-up: the native picture held across an in-place item swap", .serialized,
-       .timeLimit(.minutes(1)))
+       .timeLimit(.minutes(3)))
 @MainActor
 struct ItemSwapStillTests {
 
@@ -17,7 +17,7 @@ struct ItemSwapStillTests {
     /// Four seconds of H.264 plus silent AAC, long enough to still be playing when the capture runs
     /// and with an audio stream for the audio-switch rebuild to name. The shared fixtures end after
     /// 0.2 s, before an output attached to them sees a frame.
-    private static func fixtureURL() async throws -> URL {
+    static func fixtureURL() async throws -> URL {
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("ae711-still-\(UUID().uuidString).mp4")
         let writer = try AVAssetWriter(outputURL: file, fileType: .mp4)
@@ -186,7 +186,7 @@ struct ItemSwapStillTests {
         let watcher = Task { @MainActor in
             while !Task.isCancelled {
                 if view.isHoldingStill { held = true }
-                try? await Task.sleep(for: .milliseconds(2))
+                do { try await Task.sleep(for: .milliseconds(2)) } catch { return }
             }
         }
         let failure = await engine.reloadWithAudioOverride(
@@ -240,7 +240,7 @@ struct ItemSwapStillTests {
         let watcher = Task { @MainActor in
             while !Task.isCancelled {
                 if still.isHoldingStill { held = true }
-                try? await Task.sleep(for: .milliseconds(2))
+                do { try await Task.sleep(for: .milliseconds(2)) } catch { return }
             }
         }
         let failure = await engine.reloadWithAudioOverride(
@@ -346,7 +346,7 @@ struct ItemSwapStillTests {
         let watcher = Task { @MainActor in
             while !Task.isCancelled {
                 if view.isHoldingStill { held = true }
-                try? await Task.sleep(for: .milliseconds(2))
+                do { try await Task.sleep(for: .milliseconds(2)) } catch { return }
             }
         }
         let failure = await engine.reloadWithAudioOverride(
@@ -355,7 +355,7 @@ struct ItemSwapStillTests {
         try await waitFor { !view.isHoldingStill }
         watcher.cancel()
 
-        #expect(held)
+        #expect(held, "skipped: \(engine.heldPictureLastSkip ?? "no skip recorded")")
         #expect(engine.heldPictureLastRoute == "software renderer")
         #expect(engine.heldPictureLastRelease == "first frame of the next host")
         #expect(engine.softwareHost !== host)
@@ -384,6 +384,10 @@ struct ItemSwapStillTests {
         try await waitFor { host.isVideoReadyForDisplay }
         try await Task.sleep(for: .seconds(1))
         engine.pause()
+        // Scrubbing takes the reshaped still path, not the compositor preview.
+        #expect(engine.supportsCacheBackedStills)
+        #expect(!engine.scrubPreviewDrawsInView)
+        #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) != nil)
         let started = ContinuousClock.now
         await engine.holdPictureAcrossItemSwap()
         #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds))
@@ -392,13 +396,14 @@ struct ItemSwapStillTests {
         #expect(view.isHoldingStill)
     }
     #else
-    /// Without the reshaping a Profile 5 picture cannot be made from the segment, so where the hold
-    /// would need it (the output presents Dolby Vision) it is skipped with its reason rather than
-    /// showing the planes read as YCbCr. Where AVPlayer presents the source as HDR10 (a Mac without a
-    /// Dolby Vision display), the output's own picture is correct and is held as before.
-    @Test("without the reshaping trait a Profile 5 title never holds a reshaped still",
+    /// Without the reshaping a Profile 5 picture cannot be made into a still, so where the hold needs
+    /// one (the output presents Dolby Vision) the engine plays the frame out of the resident segment
+    /// through a player of the surface's own, and the system compositor colours it. Where AVPlayer
+    /// presents the source as HDR10 (a Mac without a Dolby Vision display), the output's own picture
+    /// is correct and is held as before.
+    @Test("without the reshaping trait a Profile 5 title holds its frame through the compositor",
           .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile5URL.path)))
-    func profile5WithoutReshapingHoldsNothingReshaped() async throws {
+    func profile5WithoutReshapingHoldsThroughCompositor() async throws {
         let engine = try AetherEngine()
         defer { engine.stop() }
         let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
@@ -406,14 +411,18 @@ struct ItemSwapStillTests {
         _ = try await engine.load(url: Self.profile5URL)
         let host = try #require(engine.nativeHost)
         try await waitFor { host.isVideoReadyForDisplay }
+        try await Task.sleep(for: .seconds(1))
         engine.pause()
-        // No scrub still either, and the capability says so up front so a host hides the preview.
+        // No scrub still either; the compositor preview stands in, and the capabilities say so up front.
         #expect(!engine.supportsCacheBackedStills)
+        #expect(engine.scrubPreviewDrawsInView)
         #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) == nil)
+        let started = ContinuousClock.now
         await engine.holdPictureAcrossItemSwap()
+        #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds + 0.5))
         if AetherEngine.heldPictureNeedsReshaping(videoFormat: engine.videoFormat, dolbyVisionProfile: engine.sourceDVProfile) {
-            #expect(engine.heldPictureLastSkip == "Dolby Vision still reshaping not built in")
-            #expect(!view.isHoldingStill)
+            #expect(engine.heldPictureLastRoute == "Dolby Vision compositor")
+            #expect(view.isHoldingStill)
         } else {
             #expect(engine.heldPictureLastRoute == "native output")
         }
@@ -438,7 +447,7 @@ struct ItemSwapStillTests {
         #expect(view.isHoldingStill)
     }
 
-    private static func centreGrey(_ image: CGImage) -> Int? {
+    static func centreGrey(_ image: CGImage) -> Int? {
         var pixel = [UInt8](repeating: 0, count: 4)
         guard let context = CGContext(
             data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,

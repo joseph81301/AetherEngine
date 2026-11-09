@@ -79,6 +79,34 @@ struct DoviFelMathTests {
         #expect(Set(DoviTestSupport.rawVDR(out)[0]) == [expectedVdr], "el=\(el)")
     }
 
+    /// `elsurvey` reports `DoviResidualSurvey.inverseNlq`, a CPU copy of the kernel's arithmetic. Random
+    /// parameter sets pin it to the kernel: the composer's raw VDR output is 2048 plus the residual, clamped to
+    /// the 12-bit range.
+    @Test("DoviResidualSurvey.inverseNlq matches the composer for random NLQ parameter sets")
+    func surveyInverseNlqMatchesComposer() throws {
+        let composer = try #require(DoviFelComposer())
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func next(_ range: ClosedRange<Int32>) -> Int32 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            let span = UInt64(range.upperBound - range.lowerBound) + 1
+            return range.lowerBound + Int32((state >> 33) % span)
+        }
+        for set in 0..<40 {
+            var n = DoviGpuEdgeCaseTests.nlq(offset: next(0...1023), scale: next(0...8191),
+                                             threshold: next(-1024...3071),
+                                             vdrInMax: set % 2 == 0 ? 0 : next(0...4095))
+            n.nlqShift = UInt32(next(8...15))
+            var p = Self.rawParams(residual: true)
+            p.nlqY = n
+            for _ in 0..<5 {
+                let el = Int(next(0...1023))
+                let out = try DoviGpuEdgeCaseTests.composeConstant(composer, bl: (512, 512, 512), el: (el, 512, 512), params: p)
+                let expected = min(4095, max(0, 2048 + Int(DoviResidualSurvey.inverseNlq(n, elCode: el))))
+                #expect(Set(DoviTestSupport.rawVDR(out)[0]) == [expected], "set \(set) el=\(el)")
+            }
+        }
+    }
+
     // MARK: - D3: delta-coded pivots
 
     @Test("D3: the parser prefix-sums delta-coded pivots into absolute breakpoints")
@@ -323,6 +351,31 @@ struct DoviFelMathTests {
         let outY = outYPtr.assumingMemoryBound(to: UInt16.self)
         let sampleY = Int(outY[0] >> 6)
         #expect(sampleY > 400 && sampleY < 600, "Output Y sample must be near mid-gray (~512), was \(sampleY)")
+    }
+
+    // MARK: - NLQ ceiling
+
+    @Test("a vdr_in_max that shifts down to 0 drops the residual for that component, as an out-of-range one does")
+    func zeroVdrInMaxDropsResidual() {
+        func parse(maxInt: UInt64, maxFrac: UInt64) -> DoviNlqParams {
+            var nlq = DoviRpuDataNlq()
+            nlq.nlq_offset = (512, 512, 512)
+            nlq.linear_deadzone_slope = (1 << 20, 1 << 20, 1 << 20)       // 0.125 at denominator 23
+            nlq.vdr_in_max_int = (maxInt, maxInt, maxInt)
+            nlq.vdr_in_max = (maxFrac, maxFrac, maxFrac)
+            return withUnsafePointer(to: &nlq) {
+                DoviFelComposer.parseNlqParams(nlq: $0, component: 0, label: "Y", method: .linear,
+                                               coefLog2Denom: 23, nlqShift: 11, pivots: [])
+            }
+        }
+        let live = parse(maxInt: 0, maxFrac: 1 << 20)
+        #expect(live.nlqScale != 0)
+        #expect(live.vdrInMax > 0)
+        // 2^8 in Q23 shifts down by 11 to 0: no usable ceiling.
+        let degenerate = parse(maxInt: 0, maxFrac: 1 << 8)
+        #expect(degenerate.nlqScale == 0)
+        let zero = parse(maxInt: 0, maxFrac: 0)
+        #expect(zero.nlqScale == 0)
     }
 }
 #endif

@@ -1,6 +1,6 @@
 // aetherctl: standalone reproduction harness for AetherEngine on macOS.
 //
-// Twenty-one subcommands, most operating on a media source URL (file://
+// Twenty-four subcommands, most operating on a media source URL (file://
 // or http(s)://), a few on built-in synthetic fixtures. The full list
 // with flags and examples lives in docs/cli.md; the three original modes:
 //
@@ -67,23 +67,26 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel [--fel-output]] [--upscale] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
+                 [--subtitle-offset-reach SECONDS]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
+                 [--audio-shaping <spec>] [--switch-audio-shaping <spec>[@ms]]...
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
-             [--max-concurrent-requests N] [--atmos-bed 7.1.4]
+             [--max-concurrent-requests N] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]]
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
-                      a build with the DualLayerDolbyVision trait; --no-fel
-                      is accepted and does nothing); --surface (or --window) presents
+                      a build with the DualLayerDolbyVision trait); --upscale opts into
+                      upscaling sub-1080p SDR video to the display (#846);
+                      --surface (or --window) presents
                       into a window; --cycle-el S flips the FEL residual every S
                       seconds, which needs --fel and a surface; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
@@ -113,17 +116,22 @@ func printUsage() {
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest [--out PATH.hevc] <file>
       aetherctl feltest [--frames N] <file>   (DualLayerDolbyVision trait)
+      aetherctl dmpass [--frames N] [--out PATH.jsonl] <file>   (display-metadata passthrough check; DualLayerDolbyVision trait)
       aetherctl dvsurvey [--frames N] [--list K] <file>
-      aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
+      aetherctl eltype [--parallel N]      (label<TAB>url lines on stdin)
+      aetherctl elsurvey [--parallel N] [--points N]   (label<TAB>url lines on stdin; DualLayerDolbyVision trait)
+      aetherctl elframe --at SECONDS --out DIR <url>   (DualLayerDolbyVision trait)
+      aetherctl felcurves <url> <out.rpu>              (FEL folded into per-scene P8.1 curves; DolbyVisionFelCurves trait)
+      aetherctl extract [--at <sec>] [--preview|--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
-      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
+      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
       aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
                           never EOF, unknown size; prints physFP and its slope against that rate)
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--standard-join] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
@@ -207,9 +215,10 @@ func printUsage() {
 
     Flags (extract only):
       --at <sec>     Seek position in seconds (default 60.0).
+      --preview      Frame-accurate decode downscaled to --width.
       --snapshot     Frame-accurate decode at full resolution instead
                      of nearest-keyframe thumbnail.
-      --width <px>   Max output width for thumbnail mode (default 320).
+      --width <px>   Max output width for thumbnail/preview mode (default 320).
       --loops <n>    Repeat extraction N times, cycling through 8
                      positions. Useful with `leaks --atExit`.
 
@@ -278,8 +287,8 @@ func printUsage() {
 
       extract   Extract a still frame from a source. Thumbnail mode
                 (default) seeks to the nearest keyframe and downscales
-                to --width. Snapshot mode (--snapshot) decodes
-                frame-accurately at full resolution. Use --loops N
+                to --width. Preview mode (--preview) decodes frame-accurately
+                at --width; snapshot mode (--snapshot) uses full resolution. Use --loops N
                 with `leaks --atExit` to detect memory leaks.
                 Writes the first frame to aetherctl-extract-<mode>.png
                 in a private per-user temporary directory, printed.
@@ -313,8 +322,9 @@ func printUsage() {
 // MARK: - Object audio
 
 /// `--atmos-bed 7.1.4`: TrueHD Atmos or DTS:X rendered into that bed and delivered as APAC
-/// (`LoadOptions.objectAudioRendering`, #731). Without it the channel bridge plays them.
-private func objectAudioRendering(_ flag: String?) -> ObjectAudioRendering {
+/// (`LoadOptions.objectAudioRendering`, #731), or with `--bed-format lpcm` as 24-bit PCM. Without it
+/// the channel bridge plays them.
+private func objectAudioRendering(_ flag: String?, format: String? = nil) -> ObjectAudioRendering {
     guard let flag else { return .off }
     guard let layout = SpatialSpeakerLayout(rawValue: flag) else {
         print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(flag)'")
@@ -323,7 +333,13 @@ private func objectAudioRendering(_ flag: String?) -> ObjectAudioRendering {
     #if !(TrueHDObjectAudio || DTSXObjectAudio)
     print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
     #endif
-    return .apac(layout)
+    switch format {
+    case nil, "apac": return .apac(layout)
+    case "lpcm": return .lpcm(layout)
+    default:
+        print("ERROR: --bed-format expects apac or lpcm, got '\(format!)'")
+        exit(64)
+    }
 }
 
 // MARK: - URL parsing
@@ -495,6 +511,26 @@ if first == "dovitest" {
     exit(runDoviTest(url: parseSourceURL(urlArg), outputPath: outPath))
 }
 
+// Per-frame display-metadata passthrough check on the FEL route: source RPU vs the RPU attached to the frame.
+if first == "dmpass" {
+    var rest = Array(args.dropFirst(2))
+    let frames = takeIntFlag("--frames", from: &rest) ?? 300
+    let outPath = takeStringFlag("--out", from: &rest)
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: dmpass requires a <file> argument")
+        print("Usage: aetherctl dmpass [--frames N] [--out PATH.jsonl] <file>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "dmpass")
+    #if DualLayerDolbyVision
+    exit(runDmPass(url: parseSourceURL(urlArg), maxFrames: frames, out: outPath))
+    #else
+    print("ERROR: dmpass needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+    exit(64)
+    #endif
+}
+
 // Dolby Vision Profile 7 FEL dual-layer Metal reconstruction test.
 if first == "feltest" {
     var rest = Array(args.dropFirst(2))
@@ -514,6 +550,34 @@ if first == "feltest" {
     #endif
 }
 
+// Compositor scrub previews (Dolby Vision Profile 5 / 10.0), resident and from the source.
+if first == "scrubpreview" {
+    var rest = Array(args.dropFirst(2))
+    let at = takeStringFlag("--at", from: &rest) ?? "2,5,30,50,65"
+    let warm = takeDoubleFlag("--warm", from: &rest) ?? 4
+    let keep = takeStringFlag("--keep", from: &rest)
+    let stills = takeFlag("--stills", from: &rest)
+    let maxRequests = takeIntFlag("--max-concurrent-requests", from: &rest)
+    let forward = takeIntFlag("--forward-buffer-segments", from: &rest)
+    if let kbps = takeIntFlag("--throttle-kbps", from: &rest) {
+        AetherEngine.setSourceThrottleKbpsForTesting(kbps)
+        print("[aetherctl] source throttle: \(kbps) kbit/s")
+    }
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("Usage: aetherctl scrubpreview [--at s1,s2,...] [--warm S] [--keep DIR] [--throttle-kbps N] "
+              + "[--stills [--max-concurrent-requests N] [--forward-buffer-segments N]] <url>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "scrubpreview")
+    let positions = at.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+    if stills {
+        exit(runScrubStills(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm,
+                            maxConcurrentRequests: maxRequests, forwardBufferSegments: forward))
+    }
+    exit(runScrubPreview(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm, keepDir: keep))
+}
+
 // Dolby Vision display-metadata survey: picks the pin for the on-device consumption test.
 if first == "dvsurvey" {
     var rest = Array(args.dropFirst(2))
@@ -527,6 +591,56 @@ if first == "dvsurvey" {
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "dvsurvey")
     exit(runDvSurvey(url: parseSourceURL(urlArg), maxFrames: frames, listFrames: list))
+}
+
+#if DualLayerDolbyVision
+// One FEL frame composed with and without its residual, as raw planes: elframe --at SECONDS --out DIR <url>.
+if first == "elframe" {
+    var rest = Array(args.dropFirst(2))
+    let at = takeDoubleFlag("--at", from: &rest) ?? 0
+    guard let outIdx = rest.firstIndex(of: "--out"), outIdx + 1 < rest.count else {
+        print("Usage: aetherctl elframe --at SECONDS --out DIR <url>")
+        exit(64)
+    }
+    let out = URL(fileURLWithPath: rest[outIdx + 1])
+    rest.removeSubrange(outIdx...(outIdx + 1))
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("Usage: aetherctl elframe --at SECONDS --out DIR <url>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "elframe")
+    exit(runElFrame(url: parseSourceURL(urlArg), seconds: at, outDir: out))
+}
+
+// What each title's enhancement layer does to its picture, measured at sampled keyframes: `label<TAB>url` lines on stdin.
+if first == "elsurvey" {
+    var rest = Array(args.dropFirst(2))
+    let parallel = takeIntFlag("--parallel", from: &rest) ?? 8
+    let points = takeIntFlag("--points", from: &rest) ?? 48
+    rejectStrayFlags(rest, subcommand: "elsurvey")
+    exit(runElSurvey(parallel: parallel, points: points))
+}
+#endif
+
+#if DolbyVisionFelCurves
+// A FEL source folded into the luma curve of its Profile 8.1 RPUs (mapping kept), written out: felcurves <url> <out.rpu>.
+if first == "felcurves" {
+    let rest = Array(args.dropFirst(2))
+    guard rest.count == 2 else {
+        print("Usage: aetherctl felcurves <url> <out.rpu>")
+        exit(64)
+    }
+    exit(runFelCurves(url: parseSourceURL(rest[0]), outPath: rest[1]))
+}
+#endif
+
+// FEL / MEL for many sources at once: `label<TAB>url` lines on stdin.
+if first == "eltype" {
+    var rest = Array(args.dropFirst(2))
+    let parallel = takeIntFlag("--parallel", from: &rest) ?? 8
+    rejectStrayFlags(rest, subcommand: "eltype")
+    exit(runElType(parallel: parallel))
 }
 
 // #93 post-recovery judder: raw video packet timing per demuxer open profile.
@@ -554,15 +668,16 @@ if first == "audiotap" {
     rest.removeAll { $0 == "--remote" }
     let software = rest.contains("--software")
     rest.removeAll { $0 == "--software" }
+    let dialogue = takeFlag("--dialogue", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
-        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>")
+        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "audiotap")
     exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath,
-                 remote: remote, software: software))
+                 remote: remote, software: software, channels: dialogue ? .dialogue : .downmix))
 }
 
 if first == "hlsfixture" {
@@ -595,8 +710,13 @@ if first == "live" {
     let discontinuityAt = takeDoubleFlag("--discontinuity-at", from: &rest)
     // --realtime paces fixture output at ~1x wall-clock; default is as-fast-as-socket-drains.
     let realtime = takeFlag("--realtime", from: &rest)
-    // --fast-zap: LoadOptions.liveJoinProfile = .fastZap (AE#195 low-latency live join).
-    let fastZap = takeFlag("--fast-zap", from: &rest)
+    // The engine default is .fastZap (AE#195); --standard-join loads .standard for an A/B, and
+    // --fast-zap is still accepted so older scripts keep running.
+    let standardJoin = takeFlag("--standard-join", from: &rest)
+    _ = takeFlag("--fast-zap", from: &rest)
+    let fastZap = !standardJoin
+    // --live-cushion N: LoadOptions.liveEdgeCushionSeconds.
+    let liveFixtureCushion = takeDoubleFlag("--live-cushion", from: &rest)
     // --preroll N: backlog seconds the paced fixture bursts before 1x pacing (default 30).
     // 0 models a strict-realtime origin with no backlog (the AE#195 slow-join case).
     let preroll = takeDoubleFlag("--preroll", from: &rest)
@@ -655,7 +775,7 @@ if first == "live" {
                  reloadTest: reloadTest,
                  forceSoftware: forceSW, dropAfter: dropAfter,
                  discontinuityAt: discontinuityAt, realtime: realtime || realtimeRate != nil,
-                 fastZap: fastZap, pacingPreroll: preroll, pacingRate: realtimeRate,
+                 fastZap: fastZap, liveCushion: liveFixtureCushion, pacingPreroll: preroll, pacingRate: realtimeRate,
                  originLead: originLead,
                  freezeAfter: freezeAfter, unfreezeAfter: unfreezeAfter,
                  rewindBeforeFreeze: rewindBeforeFreeze,
@@ -685,7 +805,9 @@ if first == "play" {
     // actually runs, and it could not be driven from here at all: the TARGETDURATION floor comes from
     // the UPSTREAM's observed cadence, so what a fastZap start costs depends on an origin the raw-TS
     // fixture does not have.
-    let playFastZap = takeFlag("--fast-zap", from: &rest)
+    let playStandardJoin = takeFlag("--standard-join", from: &rest)
+    _ = takeFlag("--fast-zap", from: &rest)
+    let playFastZap = !playStandardJoin
     // AE#440: LoadOptions.liveJoinStartsImmediately. The join tail after the first serve, where AVPlayer
     // holds a presented frame still while it evaluates whether its cushion will sustain playback. The
     // hold does not reproduce on this harness (loopback answers at memory speed, so the evaluation
@@ -697,6 +819,8 @@ if first == "play" {
     let playLiveStartImmediately = takeFlag("--live-start-immediately", from: &rest)
     let playNoLiveStartImmediately = takeFlag("--no-live-start-immediately", from: &rest)
     let liveStartImmediately = playLiveStartImmediately ? true : !playNoLiveStartImmediately
+    // LoadOptions.liveEdgeCushionSeconds: how far behind the live edge the session plays.
+    let liveCushion = takeDoubleFlag("--live-cushion", from: &rest)
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
@@ -723,13 +847,14 @@ if first == "play" {
     let playRecord = takeStringFlag("--record", from: &rest).map { URL(fileURLWithPath: $0) }
     // Dolby Vision Profile 7 FEL dual-layer decoding, opt-in like the engine's own
     // `preferDualLayerDolbyVision` (default false): `--fel` turns it on, so a plain `play` runs the
-    // route a host gets by default. `--no-fel` / `--no-dual-layer` are accepted as no-ops for the
-    // scripts written when `play` turned it on by itself. Each spelling is taken separately, so
-    // passing two leaves neither behind in `rest`.
+    // route a host gets by default.
     let playFel = takeFlag("--fel", from: &rest)
-    _ = takeFlag("--no-fel", from: &rest)
-    _ = takeFlag("--no-dual-layer", from: &rest)
     let playPreferDualLayerDV = playFel
+    // `LoadOptions.dualLayerRoute`: `--fel-output` composes the FEL on AVPlayer's own frames instead of the
+    // software host's (needs --fel).
+    let playFelOutput = takeFlag("--fel-output", from: &rest)
+    // #846: `LoadOptions.upscalesLowResolutionVideo`, off by default as in the engine.
+    let playUpscale = takeFlag("--upscale", from: &rest)
     let playSurfaceFlag = takeFlag("--surface", from: &rest)
     let playWindowFlag = takeFlag("--window", from: &rest)
     let playAttachSurface = playSurfaceFlag || playWindowFlag
@@ -827,7 +952,8 @@ if first == "play" {
     // with a throttled origin to see the startup difference; on a fast source nothing changes.
     let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
     // #731: TrueHD Atmos or DTS:X rendered into a bed as APAC; the 1 Hz line then reports its objects.
-    let playObjectAudio = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
+    let playObjectAudio = objectAudioRendering(
+        takeStringFlag("--atmos-bed", from: &rest), format: takeStringFlag("--bed-format", from: &rest))
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -867,6 +993,7 @@ if first == "play" {
                                   delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20) : 20)
     }
     let teletextPage = takeIntFlag("--teletext-page", from: &rest)
+    let subtitleOffsetReach = takeDoubleFlag("--subtitle-offset-reach", in: 0...600, from: &rest)
     // #364: `<page|auto>[@ms]`. The default delay is 20 s, not the audio switch's 20 ms: this one has
     // to land on a channel that is already showing a teletext track, else the run proves nothing the
     // load option did not already prove.
@@ -901,11 +1028,34 @@ if first == "play" {
             milliseconds: ms,
             delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
     }
+    // AE#923: `--audio-shaping <spec>` is the load option, `--switch-audio-shaping <spec>[@ms]` the
+    // runtime setter. A spec is `off` or a comma list of `ch=N`, `dialogue=DB`, `night`.
+    var audioShaping = AudioShaping()
+    if let spec = takeStringFlag("--audio-shaping", from: &rest) {
+        guard let parsed = parseAudioShapingSpec(spec) else {
+            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night; got '\(spec)'")
+            exit(64)
+        }
+        audioShaping = parsed
+    }
+    var audioShapingSwitches: [AudioShapingSwitchRequest] = []
+    while let spec = takeStringFlag("--switch-audio-shaping", from: &rest) {
+        let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
+        guard let parsed = parseAudioShapingSpec(parts[0]) else {
+            print("ERROR: --switch-audio-shaping takes <spec>[@ms], got '\(spec)'")
+            exit(64)
+        }
+        audioShapingSwitches.append(AudioShapingSwitchRequest(
+            shaping: parsed, delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
+    }
     // AE#464 round 2: mount with `autoplay = false`, the shape of a host that owns transport.
     let pausedMount = takeFlag("--paused", from: &rest)
     // AE#587: LoadOptions.preserveASSMarkup, documented as ASS/SSA only. The report that it leaks
     // into SubRip could only be argued from the source because no harness set the flag at all.
     let preserveASSMarkup = takeFlag("--preserve-ass-markup", from: &rest)
+    // AE#956: LoadOptions.skipsContainerAttachments. Pair it with a throttled origin and an MKV that
+    // carries fonts to see the open stop paying for them.
+    let skipAttachments = takeFlag("--skip-attachments", from: &rest)
     // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
     // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
     // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
@@ -1024,11 +1174,13 @@ if first == "play" {
         }
         done.wait()
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
+                 subtitleOffsetReach: subtitleOffsetReach,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
+                 audioShaping: audioShaping, audioShapingSwitches: audioShapingSwitches,
                  pausedMount: pausedMount,
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
@@ -1040,8 +1192,11 @@ if first == "play" {
                  deinterlaceFieldRate: playFieldRate,
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
+                 skipAttachments: skipAttachments,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
+                 dualLayerRoute: playFelOutput ? .avPlayerOutput : .softwareHost,
+                 upscalesLowResolutionVideo: playUpscale,
                  attachSurface: playAttachSurface,
                  record: playRecord))
 }
@@ -1057,6 +1212,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let atSeconds = takeDoubleFlag("--at", from: &rest) ?? 60.0
     let extractLoops = takeIntFlag("--loops", from: &rest) ?? 1
     let extractWidth = takeIntFlag("--width", from: &rest) ?? 320
+    let previewMode = takeFlag("--preview", from: &rest)
     let snapshotMode = takeFlag("--snapshot", from: &rest)
     // The opt-in detail passes of `AetherEngine.probe(url:detecting:)`, so both are observable from the CLI
     // instead of only through a host. Each costs reads past find_stream_info; the bare `probe` does neither.
@@ -1067,6 +1223,15 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let inMemory = takeFlag("--memory", from: &rest)
     let forwardOnly = takeFlag("--forward-only", from: &rest)
     let customAudioIndex = takeIntFlag("--audio-index", from: &rest).map(Int32.init)
+    // `--stereo auto|mono|sbs|ou`: serve a 3D source the way visionOS gets it, from any system.
+    let serveStereo: StereoPresentation? = takeStringFlag("--stereo", from: &rest).map {
+        switch $0 {
+        case "mono": return .mono
+        case "sbs": return .sideBySide
+        case "ou": return .overUnder
+        default: return .automatic
+        }
+    }
     let audioOnlyFlag = takeFlag("--audio-only", from: &rest)
     // AE#445: the custom-source live shape had no harness at all, so a retention question about it
     // could only be reasoned about. These four flags are the reporter's reader in parameters.
@@ -1137,7 +1302,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // being judged by ear.
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
     // #731: TrueHD Atmos or DTS:X rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
-    let serveObjectAudioRendering = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
+    let serveObjectAudioRendering = objectAudioRendering(
+        takeStringFlag("--atmos-bed", from: &rest), format: takeStringFlag("--bed-format", from: &rest))
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -1161,17 +1327,21 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                  audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
                  objectAudioRendering: serveObjectAudioRendering,
                  // `--audio-index` (parsed once above, shared with customio): serve that source stream.
-                 audioStreamIndex: customAudioIndex)
+                 audioStreamIndex: customAudioIndex, stereo: serveStereo)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))
     case "swdecode":
         exit(runSWDecode(url: url, maxPackets: framesOverride ?? 100))
     case "extract":
+        if previewMode, snapshotMode {
+            print("ERROR: extract accepts only one of --preview or --snapshot")
+            exit(64)
+        }
         exit(runExtract(
             url: url,
             at: atSeconds,
-            mode: snapshotMode ? .snapshot : .thumbnail,
+            mode: previewMode ? .preview : (snapshotMode ? .snapshot : .thumbnail),
             loops: extractLoops,
             maxWidth: extractWidth
         ))

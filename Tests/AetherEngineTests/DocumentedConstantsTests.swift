@@ -18,6 +18,13 @@ import AetherLibavcodec
 /// Adding a number to the docs? Pin it here in the same commit.
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
+    func testDemuxNSErrorCaseCodesMatchDocumentation() throws {
+        XCTAssertEqual((DemuxerError.openFailed(code: -1) as NSError).code, 0)
+        XCTAssertEqual((DemuxerError.streamInfoFailed(code: -1) as NSError).code, 1)
+        XCTAssertEqual((DemuxerError.readFailed(code: -1) as NSError).code, 2)
+        assertDocumented("0 (open), 1 (stream information), and 2 (read)", try documentation())
+    }
+
     func testLiveReplayQuarantineBoundsMatchDocumentation() throws {
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingBytes, 96 * 1_024 * 1_024)
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingPackets, 10_000)
@@ -37,6 +44,21 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("**two concurrent diagnostic reads**", docs)
         assertDocumented("**one pending retirement\nread**", docs)
         assertDocumented("five entries per item", docs)
+    }
+
+    func testNominalRateCompositionShiftMatchesDocumentation() throws {
+        XCTAssertEqual(H264CompositionOffsetRepair.maximumNominalShiftPictures, 16)
+        assertDocumented("clamped to **16 pictures**", try documentation())
+    }
+
+    func testCompositionSampleExtensionMatchesDocumentation() throws {
+        XCTAssertEqual(H264CompositionOffsetRepair.extendedSampleTarget, 48)
+        assertDocumented("up to\n**48 pictures**", try documentation())
+    }
+
+    func testLandingEnvelopeHoldMatchesDocumentation() throws {
+        XCTAssertEqual(H264CompositionOffsetRepair.landingEnvelopePictures, 8)
+        assertDocumented("first **8 pictures**", try documentation())
     }
 
     func testPartialCompositionHoldBoundsMatchDocumentation() throws {
@@ -69,9 +91,9 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(DualLayerVideoDecoder.maxEnhancementLayerQueueFrames, 10)
         XCTAssertEqual(FrameSideDataRing.capacity, 32)
         XCTAssertEqual(FrameSideDataRing.jitterToleranceTicks, 300)
-        XCTAssertEqual(DoviFelComposer.maxFramesInFlight, 3)
+        XCTAssertEqual(DoviFelComposer.maxFramesInFlight, 2)
         XCTAssertEqual(SampleBufferRenderer.felVideoLookaheadFrames, 9)
-        XCTAssertEqual(DoviFelComposer.outputPoolAllocationThreshold, 15)
+        XCTAssertEqual(DoviFelComposer.outputPoolAllocationThreshold, 14)
         XCTAssertEqual(DoviFelComposer.outputPoolReserve, 3)
         XCTAssertEqual(DualLayerVideoDecoder.maxBorrowedParamsRun, 3)
         XCTAssertEqual(SampleBufferRenderer.hardwareDecoderReorderDepth, 4)
@@ -82,22 +104,69 @@ final class DocumentedConstantsTests: XCTestCase {
                        0.036, accuracy: 1e-9)
 
         assertDocumented("once K = 3 newer base-layer", fel)
-        assertDocumented("is the maximum layer skew, 3;", fel)
+        assertDocumented("(`maxLayerSkewFrames`) is the maximum layer", fel)
+        assertDocumented("skew, 3, and is the whole rule", fel)
+
+        // The deadline release (§5.5) and its log lines (§5.11).
+        XCTAssertEqual(DualLayerVideoDecoder.deadlineMarginFloor, 0.1)
+        XCTAssertEqual(DualLayerVideoDecoder.enhancementGraceFloor, 0.015)
+        XCTAssertEqual(DualLayerVideoDecoder.enhancementGraceCap, 0.05)
+        XCTAssertEqual(DualLayerVideoDecoder.heldClockWallBound, 2)
+        XCTAssertEqual(DualLayerVideoDecoder.maxDeadlineHoldFrames, 6)
+        XCTAssertEqual(DoviFelComposer.maxFramesInFlight + DualLayerVideoDecoder.maxLayerSkewFrames + 2, 7)
+        XCTAssertEqual(DualLayerVideoDecoder.minSweepDelay, 0.002)
+        XCTAssertEqual(DualLayerVideoDecoder.maxSweepDelay, 0.25)
+        XCTAssertEqual(DualLayerVideoDecoder.totalsLogIntervalSeconds, 10)
+        assertDocumented("least 100 ms.", fel)
+        assertDocumented("clamped to 15 to 50 ms", fel)
+        assertDocumented("it waits 2 s at most", fel)
+        assertDocumented("`maxDeadlineHoldFrames` = 6 newer arrivals", fel)
+        assertDocumented("`maxFramesInFlight + maxLayerSkew + 2` = 7 pending frames", fel)
+        assertDocumented("every 2 to 250 ms", fel)
+        assertDocumented("at most every 10 s", fel)
+        assertDocumented("`maxDeadlineHoldFrames` = 6 with a render clock", fel)
         assertDocumented("waiting enhancement frames capped at 10", fel)
         assertDocumented("At most 10 enhancement frames wait", fel)
         assertDocumented("fixed capacity 32", fel)
         assertDocumented("within ±300 ticks", fel)
-        assertDocumented("wait for one of 3 in-flight slots", fel)
+        assertDocumented("wait for one of 2 in-flight slots", fel)
         assertDocumented("look-ahead (9)", fel)
-        assertDocumented("the in-flight slots (3) + 1, so 15", fel)
+        assertDocumented("the in-flight slots (2) + 1, so 14", fel)
         assertDocumented("a reserve of 3 more", fel)
-        assertDocumented("allocation threshold 15 + reserve 3", fel)
+        assertDocumented("allocation threshold 14 + reserve 3", fel)
         assertDocumented("`maxBorrowedParamsRun` (3)", fel)
         assertDocumented("the renderer's 4-frame reorder buffer", fel)
         assertDocumented("last 64\n  settled base-layer keys", fel)
         assertDocumented("for at most about 36 ms", fel)
         assertDocumented("Counters feed a 1 Hz summary", fel)
         _ = docs
+    }
+
+    /// The memory the deadline rule's queue can hold (dolby-vision-fel.md §5.10). Base-layer frames are
+    /// 10-bit 4:2:0 in 16-bit containers, which is 3 bytes a pixel: the composer accepts only
+    /// `420YpCbCr10BiPlanarVideoRange`. A 4K frame is about 25 MB, so six of them are about 150 MB.
+    func testDeadlineQueueMemoryMatchesDocumentation() throws {
+        let frameBytes = Double(3840 * 2160 * 3)
+        XCTAssertEqual(Double(DualLayerVideoDecoder.maxDeadlineHoldFrames) * frameBytes / 1_000_000, 150, accuracy: 1)
+        XCTAssertEqual(Double(DualLayerVideoDecoder.maxLayerSkewFrames) * frameBytes / 1_000_000, 75, accuracy: 1)
+        assertDocumented("about 150 MB at 4K with the clock, 75 MB at K = 3", try felDocument())
+    }
+
+    /// The compose stall numbers (dolby-vision-fel.md §5.6) and the output buffers they reserve.
+    func testComposeStallBoundsMatchDocumentation() throws {
+        XCTAssertEqual(DualLayerVideoDecoder.composeStallSlices, 4)
+        XCTAssertEqual(DualLayerVideoDecoder.defaultComposeStallTimeout, 2)
+        XCTAssertEqual(DualLayerVideoDecoder.maxComposeStallBypassFrames, 600)
+        XCTAssertEqual(DualLayerVideoDecoder.maxComposeStallEpisodes, 3)
+        XCTAssertEqual(DualLayerVideoDecoder.composeHealthyFramesToResetStalls, 240)
+        let fel = try felDocument()
+        assertDocumented("`composeStallSlices` (4) slices of `composeStallTimeout / 4` (2 s by default)", fel)
+        assertDocumented("`maxComposeStallBypassFrames` (600,", fel)
+        assertDocumented("`maxComposeStallEpisodes` (3)", fel)
+        assertDocumented("`composeHealthyFramesToResetStalls` (240,", fel)
+        // 14 + 3 buffers of a 4K 10-bit frame, 3 bytes a pixel.
+        XCTAssertEqual(Double(14 + 3) * Double(3840 * 2160 * 3) / 1_000_000, 423, accuracy: 1)
+        assertDocumented("allocation threshold 14 + reserve 3 → 423 MB", fel)
     }
     #endif
 
@@ -116,6 +185,16 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(SoftwareLiveJoinPolicy.maximumSettleSeconds, 1.5)
         XCTAssertEqual(SoftwareLiveJoinPolicy.calmWindowSeconds, 0.25)
         assertDocumented("`SoftwareLiveJoinPolicy.leadSeconds` (4 s) behind the newest media", try documentation())
+    }
+
+    /// docs/formats.md quotes the segmented holdback of a live HLS ingest on the software path (AE#813).
+    func testSoftwareLiveHoldbackMatchesDocumentation() throws {
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 2).joinLeadSeconds, 4)
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 10).joinLeadSeconds, 16)
+        XCTAssertEqual(SoftwareLiveHoldback.maximumLeadSeconds, 45)
+        XCTAssertEqual(SoftwareLiveHoldback.resumeSlackSeconds, 2)
+        assertDocumented("`1.5 x segment + 1 s` behind the newest media (4 s on 2 s segments, 16 s on 10 s segments, at most 45 s)",
+                         try documentation())
     }
 
     // MARK: - Documentation corpus
@@ -421,6 +500,13 @@ final class DocumentedConstantsTests: XCTestCase {
         return text
     }
 
+    // MARK: - Keyframe-snapped seeks (docs/api.md, seek(to:))
+
+    func testKeyframeSnapReachMatchesDocumentation() throws {
+        XCTAssertEqual(SWKeyframeSnap.reachSeconds, 10)
+        assertDocumented("lands on the keyframe nearest the target, within 10 s", try documentation())
+    }
+
     // MARK: - Picture-order pairing (docs/dolby-vision-fel.md §5.3)
 
     #if DualLayerDolbyVision
@@ -429,4 +515,27 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("more than 16 slots off its unit", try felDocument())
     }
     #endif
+
+    // MARK: - AVPlayer-output route (docs/dolby-vision-fel.md §5.2.4)
+
+    #if DualLayerDolbyVision
+    func testOutputRouteConstantsMatchDocumentation() throws {
+        let fel = try felDocument()
+        XCTAssertEqual(DualLayerRouteDecision.maxForwardBufferSegments, 10)
+        XCTAssertEqual(DualLayerOutputRoute.pullAheadSeconds, 0.15)
+        XCTAssertEqual(VideoPacketHistory.defaultCapacityBytes, 1 << 30)
+        XCTAssertEqual(DualLayerOutputRoute.defaultStopWaitSeconds, 2.0)
+        assertDocumented("capped at 10 segments (the default) on this route", fel)
+        assertDocumented("Frames are taken 0.15 s ahead of the item clock", fel)
+        assertDocumented("1 GiB at most", fel)
+        assertDocumented("which waits at most 2 s for a pull or feed tick", fel)
+    }
+    #endif
+
+    // MARK: - Split-layer join repair (docs/dolby-vision-fel.md)
+
+    func testLayerJoinRepairRunMatchesDocumentation() throws {
+        XCTAssertEqual(DolbyVisionLayerJoin<Int>.agreeingRunForRepair, 16)
+        assertDocumented("once sixteen units agreed", try felDocument())
+    }
 }

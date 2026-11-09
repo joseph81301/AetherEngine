@@ -76,6 +76,8 @@ protocol HLSSegmentProvider: AnyObject {
     var masterCodecs: String? { get }
     var masterResolution: (width: Int, height: Int)? { get }
     var masterVideoRange: HLSVideoRange? { get }
+    /// REQ-VIDEO-LAYOUT on EXT-X-STREAM-INF ("CH-STEREO" for a stereo session); nil omits it.
+    var masterVideoLayout: String? { get }
     var masterBandwidth: Int? { get }
 
     /// SUPPLEMENTAL-CODECS on EXT-X-STREAM-INF. DV P8.1 = "dvh1.08.LL/db1p", P8.4 = "dvh1.08.LL/db4h"; P5 is nil (dvh1.05.LL goes in primary CODECS). AVPlayer's master-level codec filter silently drops variants whose primary CODECS it can't fall back to; bare dvh1 master stalled at fetch 2-3 without advancing to media.m3u8.
@@ -133,6 +135,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// Block until at least one live segment is ready or timeout elapses. Holds the first live response so AVPlayer never sees an empty playlist (-12888).
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool
 
+    /// `LoadOptions.liveEdgeCushionSeconds` as validated: raises the served `HOLD-BACK` and, with it,
+    /// the first-serve gate's depth and deadline. nil keeps `3 x TARGETDURATION`.
+    var liveEdgeCushionSeconds: Double? { get }
+
     /// LL-HLS blocking reload: block until segment at absolute index exists. Holds AVPlayer's ?_HLS_msn= reload open so it receives the new segment the instant it is cut, not a poll-interval late.
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool
 
@@ -187,6 +193,7 @@ extension HLSSegmentProvider {
     var masterCodecs: String? { nil }
     var masterResolution: (width: Int, height: Int)? { nil }
     var masterVideoRange: HLSVideoRange? { nil }
+    var masterVideoLayout: String? { nil }
     var masterBandwidth: Int? { nil }
     var masterSupplementalCodecs: String? { nil }
     var masterFrameRate: Double? { nil }
@@ -217,6 +224,7 @@ extension HLSSegmentProvider {
         )
     }
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
+    var liveEdgeCushionSeconds: Double? { nil }
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool { true }
     var liveBlockingReloadHoldSeconds: TimeInterval { 18.0 }
@@ -1171,7 +1179,8 @@ final class HLSLocalServer: @unchecked Sendable {
                         }
                     }
                 } else {
-                    _ = p.waitForFirstLiveSegment(timeout: 30.0)
+                    _ = p.waitForFirstLiveSegment(timeout: LiveEdgePolicy.firstServeTimeoutSeconds(
+                        edgeCushionSeconds: p.liveEdgeCushionSeconds))
                 }
             } else if let p = provider, p.playlistType == .event {
                 // Sequential append playlist: hold until the startup segments exist. A fast
@@ -1781,7 +1790,9 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         var lines: [String] = []
         lines.append("#EXTM3U")
-        lines.append("#EXT-X-VERSION:7")
+        // A REQ- attribute needs version 12: under 7 AVPlayer refuses the master (-12642, measured on
+        // macOS 27 and the visionOS 27 simulator). Every other master keeps the version it always had.
+        lines.append(provider.masterVideoLayout != nil ? "#EXT-X-VERSION:12" : "#EXT-X-VERSION:7")
         lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
 
         // EXT-X-STREAM-INF attribute order per Apple's HLS Authoring Spec Appendixes: BANDWIDTH, AVERAGE-BANDWIDTH, CODECS, SUPPLEMENTAL-CODECS, RESOLUTION/FRAME-RATE/VIDEO-RANGE, HDCP-LEVEL/CLOSED-CAPTIONS.
@@ -1808,6 +1819,9 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         if let hdcp = provider.masterHDCPLevel {
             streamInfAttrs.append("HDCP-LEVEL=\(hdcp)")
+        }
+        if let layout = provider.masterVideoLayout {
+            streamInfAttrs.append("REQ-VIDEO-LAYOUT=\"\(layout)\"")
         }
         // AE#458: the audio is muxed into the variant, so its rendition carries no URI (RFC 8216 4.3.4.2.1).
         // That tag is the ONLY place AVFoundation reads an audio language from on an HLS asset: measured on
@@ -2099,7 +2113,9 @@ final class HLSLocalServer: @unchecked Sendable {
             // stall-danger zone (-16832) whenever the served window carries less than 3 x TD behind the
             // edge (AE#189: 5.76s long-GOP segments -> TD=6 -> 18s holdback vs a 9.6s startup window). The
             // startup cushion is built to exactly this depth, so the advertised value is always satisfiable.
-            let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration)
+            // A host's `liveEdgeCushionSeconds` raises both together.
+            let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration,
+                                                          edgeCushionSeconds: provider.liveEdgeCushionSeconds)
             serverControl.append("HOLD-BACK=\(String(format: "%.3f", holdBack))")
             lines.append("#EXT-X-SERVER-CONTROL:\(serverControl.joined(separator: ","))")
         }

@@ -7,7 +7,8 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
               dolbyVisionHandling: DolbyVisionHandling = .automatic,
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
               audioDelayMs: Int = 0, iFrames: Bool = false,
-              objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil) -> Never {
+              objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil,
+              stereo: StereoPresentation? = nil) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -24,8 +25,14 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if let pos = startPosition { flagSuffix += " [--start-position \(pos)]" }
     if audioDelayMs != 0 { flagSuffix += " [--audio-delay \(audioDelayMs)]" }
     if iFrames { flagSuffix += " [--iframes]" }
-    if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
+    switch objectAudioRendering {
+    case .apac(let layout): flagSuffix += " [--atmos-bed \(layout.rawValue)]"
+    case .lpcm(let layout): flagSuffix += " [--atmos-bed \(layout.rawValue) --bed-format lpcm]"
+    case .render(let layout): flagSuffix += " [--atmos-bed \(layout.rawValue) --bed-format auto]"
+    case .off: break
+    }
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
+    if let stereo { flagSuffix += " [--stereo \(stereo)]" }
     print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
@@ -38,7 +45,10 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
         // for the whole verdict. A source with nothing to correct never gets past the gate inside.
         dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url),
         audioSourceStreamIndexOverride: audioStreamIndex,
-        objectAudioRendering: objectAudioRendering
+        objectAudioRendering: objectAudioRendering,
+        // nil (no flag) is the session as this system gets it; a flag resolves it as visionOS would.
+        stereoPresentation: stereo ?? .automatic,
+        stereoOnAnySystem: stereo != nil
     )
     // Resume anchor exactly like AetherEngine.loadNative's load(startPosition:) (#99 repro).
     engine.initialStartSeconds = startPosition

@@ -73,10 +73,12 @@ extension PrewarmStoreSuites {
             let reader = AVIOReader(url: url(server))
             defer { reader.markClosed(); reader.close() }
             try reader.open()
-            try await waitForRequest(server, startingAt: Int64(warmBytes))
+            // AE#958: the connection re-reads the warm's last bytes to check the origin against them.
+            let frontier = Int64(warmBytes) - Int64(AVIOReader.rangeCheckBytes)
+            try await waitForRequest(server, startingAt: frontier)
 
             let opened = Array(server.requestedRanges.dropFirst(warmRequests))
-            #expect(opened.contains(where: { $0.start == Int64(warmBytes) }),
+            #expect(opened.contains(where: { $0.start == frontier }),
                     "no connection at the warm frontier: \(opened)")
             #expect(!opened.contains(where: { $0.start == 0 }),
                     "the open went back to byte zero: \(opened)")
@@ -124,10 +126,10 @@ extension PrewarmStoreSuites {
         /// A source that fits entirely inside the budget leaves nothing for a data connection to
         /// fetch, so none is opened. The guard matters because a connection asked for the range past
         /// the last byte is a 416, and the open would then look like a refusal.
-        @Test("a fully warmed source opens without any connection at all")
-        func fullyWarmedSourceOpensWithNoConnection() async throws {
+        @Test("a fully warmed source opens without any connection at all", arguments: [40 * 1024, 128 * 1024])
+        func fullyWarmedSourceOpensWithNoConnection(size: Int) async throws {
             SourcePrewarmStore.shared.clear()
-            let small: Int64 = 40 * 1024
+            let small = Int64(size)
             let server = try #require(ThrottledOriginServer(totalSize: small))
             defer { server.stop() }
             try await warm(server, bytes: 1 << 20)
@@ -139,8 +141,37 @@ extension PrewarmStoreSuites {
             #expect(read(reader, Int(small)) == Int32(small))
 
             #expect(reader.resolvedByteSize == small)
+            // A tail request is asynchronous: counting immediately after open/read can pass before
+            // the redundant bytes=-65536 request reaches the origin. This bound asserts absence;
+            // it is not a deadline for a prerequisite event.
+            let extraRequest = try await waitFor(upTo: .milliseconds(500)) {
+                server.rangeRequestCount > warmRequests
+            }
+            #expect(!extraRequest,
+                    "a fully adopted source issued another request: \(server.requestHeaders)")
             #expect(server.rangeRequestCount == warmRequests,
                     "the open connected for a source it already held whole: \(server.requestedRanges)")
+        }
+
+        @Test("a partial warm still prefetches the missing suffix")
+        func partialWarmStillFetchesSuffix() async throws {
+            SourcePrewarmStore.shared.clear()
+            let server = try #require(ThrottledOriginServer(totalSize: fileSize))
+            defer { server.stop() }
+            try await warm(server, bytes: warmBytes)
+            let warmRequests = server.rangeRequestCount
+            #expect(SourcePrewarmStore.shared.isWarm(for: url(server)))
+
+            let reader = AVIOReader(url: url(server))
+            defer { reader.markClosed(); reader.close() }
+            try reader.open()
+            try await waitFor {
+                server.requestHeaders.dropFirst(warmRequests).contains {
+                    $0["range"] == "bytes=-65536"
+                }
+            }
+            #expect(read(reader, 32 * 1024) == 32 * 1024)
+            #expect(reader.resolvedByteSize == fileSize)
         }
 
         /// A source nobody warmed keeps the cold path exactly as it was, byte for byte.
@@ -208,7 +239,7 @@ extension PrewarmStoreSuites {
         /// write-once rule treats any positive `fileSize` as settled, so a warm that belongs to a
         /// different response would fix a wrong EOF point for the whole session. The connection that is
         /// actually serving the session gets to overrule it.
-        @Test("a connection that states a different size drops the warm", .timeLimit(.minutes(1)))
+        @Test("a connection that states a different size drops the warm", .timeLimit(.minutes(3)))
         func sizeMismatchDropsTheWarm() async throws {
             SourcePrewarmStore.shared.clear()
             let server = try #require(ThrottledOriginServer(totalSize: fileSize))

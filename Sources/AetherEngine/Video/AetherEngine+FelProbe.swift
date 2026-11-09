@@ -63,6 +63,7 @@ extension AetherEngine {
         // An `hev1` file with in-band parameter sets has an empty hvcC; the load path completes it
         // from the head of the stream before routing, and the probe must open the decoders on the
         // same record or it reports a failure the real route does not have. Seeks back to 0.
+        demuxer.enableDolbyVisionEnhancementLayerJoin()
         VideoConfigRecord.completeHEVCRecordFromInBandParameterSets(demuxer: demuxer, streamIndex: videoIdx)
         guard let stream = demuxer.stream(at: videoIdx) else {
             throw AetherEngineError.noVideoStream
@@ -132,11 +133,17 @@ extension AetherEngine {
                 let stepY = max(1, (h / 2) / 16)
                 let startX = (w / 4)
                 let startY = (h / 4)
+                // The chroma sample under a luma sample, whatever the chroma format: 4:2:0 halves both
+                // axes, 4:2:2 only the width, 4:4:4 neither.
+                let cw = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1)
+                let ch = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
                 for sy in stride(from: startY, to: startY + h / 2, by: stepY) {
                     for sx in stride(from: startX, to: startX + w / 2, by: stepX) {
                         let lumaVal = Double(y16[sy * yStride + sx] >> 6)
-                        let cbVal = Double(uv16[(sy / 2) * uvStride + (sx / 2) * 2] >> 6)
-                        let crVal = Double(uv16[(sy / 2) * uvStride + (sx / 2) * 2 + 1] >> 6)
+                        let cx = sx * cw / w
+                        let cy = sy * ch / h
+                        let cbVal = Double(uv16[cy * uvStride + cx * 2] >> 6)
+                        let crVal = Double(uv16[cy * uvStride + cx * 2 + 1] >> 6)
 
                         accum.sumLuma += lumaVal
                         accum.sumCb += cbVal

@@ -39,10 +39,16 @@ struct ExternalSubtitleSelectionTests {
     }
 
     @Test("secondary channel routes external ids")
-    func secondaryExternal() throws {
+    func secondaryExternal() async throws {
+        let url = try MultiSubtitleContainerFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
         let engine = try AetherEngine()
-        let info = engine.addExternalSubtitleTrack(makeTrack())
+        defer { engine.stop() }
+        let info = engine.addExternalSubtitleTrack(.init(url: url,
+            sourceStreamIndex: MultiSubtitleContainerFixture.spanishStreamIndex))
         engine.selectSecondarySubtitleTrack(index: info.id)
+        #expect(engine.activeSecondaryExternalSubtitleTrackID == nil)
+        await engine.secondarySidecarTask?.value
         #expect(engine.isSecondarySubtitleActive)
         #expect(engine.activeSecondaryExternalSubtitleTrackID == info.id)
         #expect(engine.activeSecondaryEmbeddedSubtitleStreamIndex == -1)
@@ -65,5 +71,99 @@ struct ExternalSubtitleSelectionTests {
         let info = engine.addExternalSubtitleTrack(makeTrack())
         #expect(engine.activeSubtitleTrackIndex == info.id)
         #expect(engine.isSubtitleActive)
+    }
+}
+
+extension ExternalSubtitleSelectionTests {
+    @Test("Internal teardown clears active identity but preserves the rebuild registry", .timeLimit(.minutes(3)))
+    func teardownIdentity() throws {
+        let engine = try AetherEngine()
+        let url = URL(fileURLWithPath: "/nonexistent/subtitle.srt")
+        let track = engine.addExternalSubtitleTrack(.init(url: url, name: "external"))
+        engine.setSecondarySubtitleIdentity(external: track.id)
+        engine.isSecondarySubtitleActive = true
+        engine.stopInternal(resetDisplayCriteria: false)
+        #expect(engine.activeSecondaryExternalSubtitleTrackID == nil)
+        #expect(engine.externalSubtitleRegistry[track.id] != nil)
+        #expect(!engine.isSecondarySubtitleActive)
+        engine.stop()
+    }
+
+    @Test("Embedded selection removes the old one-shot sidecar URL", .timeLimit(.minutes(3)))
+    func embeddedSelectionClearsSidecar() throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        engine.loadedURL = URL(fileURLWithPath: "/nonexistent/movie.mkv")
+        engine.loadedSecondarySidecarURL = URL(fileURLWithPath: "/nonexistent/subtitle.srt")
+        engine.selectSecondarySubtitleTrack(index: 3)
+        #expect(engine.loadedSecondarySidecarURL == nil)
+        #expect(engine.activeSecondaryEmbeddedSubtitleStreamIndex == 3)
+    }
+
+    @Test("A rebuilt external companion retains its selected container stream", .timeLimit(.minutes(3)))
+    func registryStreamRestoration() async throws {
+        let url = try MultiSubtitleContainerFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let info = engine.addExternalSubtitleTrack(.init(
+            url: url, name: "Spanish", language: "es", httpHeaders: ["X-Test": "track"],
+            sourceStreamIndex: MultiSubtitleContainerFixture.spanishStreamIndex))
+        engine.selectSecondarySubtitleTrack(index: info.id)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.secondarySubtitleCues.compactMap(\.text) == MultiSubtitleContainerFixture.spanishLines)
+        let savedID = engine.activeSecondaryExternalSubtitleTrackID
+        let savedURL = engine.loadedSecondarySidecarURL
+        engine.stopInternal(resetDisplayCriteria: false)
+        engine.restoreSecondarySubtitleAfterRebuild(externalID: savedID, sidecarURL: savedURL,
+                                                    embeddedIndex: -1, startAt: 0)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.activeSecondaryExternalSubtitleTrackID == info.id)
+        #expect(engine.secondarySubtitleCues.compactMap(\.text) == MultiSubtitleContainerFixture.spanishLines)
+        #expect(engine.externalSubtitleRegistry[info.id]?.httpHeaders == ["X-Test": "track"])
+        engine.removeExternalSubtitleTrack(id: info.id)
+        #expect(!engine.isSecondarySubtitleActive)
+        #expect(engine.secondarySubtitleCues.isEmpty)
+    }
+}
+
+extension ExternalSubtitleSelectionTests {
+    @Test("A prior load's decode cannot change current cues or loading state", .timeLimit(.minutes(3)))
+    func staleDecodeDoesNotPublish() async throws {
+        let url = try MultiSubtitleContainerFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let info = engine.addExternalSubtitleTrack(.init(
+            url: url, name: "Spanish", sourceStreamIndex: MultiSubtitleContainerFixture.spanishStreamIndex))
+        engine.selectSecondarySubtitleTrack(index: info.id)
+        let oldTask = engine.secondarySidecarTask
+        // Advance ownership without cancellation to exercise the independent generation fence.
+        engine.loadGeneration &+= 1
+        engine.secondarySubtitleCues = []
+        engine.isLoadingSecondarySubtitles = true
+        await oldTask?.value
+        #expect(engine.secondarySubtitleCues.isEmpty)
+        #expect(engine.isLoadingSecondarySubtitles)
+    }
+}
+
+extension ExternalSubtitleSelectionTests {
+    @Test("The same registered track remains selectable in both channels", .timeLimit(.minutes(3)))
+    func noDownstreamExclusivityRule() async throws {
+        let url = try MultiSubtitleContainerFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let info = engine.addExternalSubtitleTrack(.init(
+            url: url, name: "Spanish", sourceStreamIndex: MultiSubtitleContainerFixture.spanishStreamIndex))
+        engine.selectSubtitleTrack(index: info.id)
+        engine.selectSecondarySubtitleTrack(index: info.id)
+        await engine.sidecarTask?.value
+        await engine.secondarySidecarTask?.value
+        #expect(engine.activeSubtitleTrackIndex == info.id)
+        #expect(engine.activeSecondaryExternalSubtitleTrackID == info.id)
+        #expect(engine.subtitleCues.compactMap(\.text) == engine.secondarySubtitleCues.compactMap(\.text))
+        #expect(!engine.secondarySubtitleCues.isEmpty)
     }
 }

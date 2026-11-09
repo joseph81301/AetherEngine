@@ -39,10 +39,15 @@ final class PacketRingBuffer: @unchecked Sendable {
     static let minimumLiveByteBudget = 64 << 20
 
     /// The native path's retention funnel (min(2 GiB, a quarter of free space)) with the live floor.
-    static func liveByteBudget(volumeAvailableBytes: Int64?, capRelaxed: Bool = false) -> Int {
+    /// A host's explicit `LoadOptions.liveDVRByteBudget` replaces the 2 GiB default and keeps the
+    /// quarter-of-free-space clamp: a window meant to hold a whole recording in progress (hours of
+    /// broadcast MPEG-2) does not fit in 2 GiB.
+    static func liveByteBudget(volumeAvailableBytes: Int64?, capRelaxed: Bool = false,
+                               requestedBytes: Int? = nil) -> Int {
         max(minimumLiveByteBudget,
-            HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: volumeAvailableBytes,
-                                                       capRelaxed: capRelaxed))
+            HLSVideoEngine.resolveSessionCacheBudget(requestedBytes: requestedBytes,
+                                                     volumeAvailableBytes: volumeAvailableBytes,
+                                                     capRelaxed: capRelaxed).baseEffectiveBytes)
     }
 
     // MARK: - Private types
@@ -358,6 +363,27 @@ final class PacketRingBuffer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return lastKeyframeIndexLocked(atOrBefore: target).map { firstSeq + ($0 - head) }
+    }
+
+    /// The first retained keyframe at or after `seq`, with its PTS, from the index alone (AE#844).
+    func keyframe(atOrAfterSeq seq: Int) -> (seq: Int, pts: Double)? {
+        lock.lock()
+        defer { lock.unlock() }
+        var low = keyframeHead
+        var high = keyframeSeqs.count
+        while low < high {
+            let mid = (low + high) / 2
+            if keyframeSeqs[mid] < seq { low = mid + 1 } else { high = mid }
+        }
+        guard low < keyframeSeqs.count, let idx = indexLocked(keyframeSeqs[low]) else { return nil }
+        return (keyframeSeqs[low], entries[idx].pts)
+    }
+
+    /// The PTS of the packet at `seq`, from the index alone, or nil if evicted or not yet appended.
+    func pts(atSeq seq: Int) -> Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return indexLocked(seq).map { entries[$0].pts }
     }
 
     /// Sequence of the EARLIEST retained keyframe, or nil if the ring holds no keyframe yet. DVR reseed

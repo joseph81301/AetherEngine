@@ -31,6 +31,11 @@ public enum DoviRpuConverter {
         let convertedRpu: [UInt8]?
         #if DualLayerDolbyVision
         let rpuParams: DoviMetalParams?
+        /// The same RPU in Profile 8.1 with its luma/chroma mapping kept: what a frame presented as its
+        /// raw base layer carries (a frame released without its enhancement layer), so the display side
+        /// does the reshaping the composer did not. Set whenever `convertedRpu` is and the RPU was
+        /// parsed for the dual-layer route; nil otherwise.
+        let baseLayerRpu: [UInt8]?
         #endif
         let isFEL: Bool
         let isMEL: Bool
@@ -42,11 +47,12 @@ public enum DoviRpuConverter {
         let disableResidual: Bool
 
         #if DualLayerDolbyVision
-        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, rpuParams: DoviMetalParams? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
+        init(elPacket: UnsafeMutablePointer<AVPacket>?, rpuData: [UInt8]?, convertedRpu: [UInt8]? = nil, baseLayerRpu: [UInt8]? = nil, rpuParams: DoviMetalParams? = nil, isFEL: Bool, isMEL: Bool = false, success: Bool, usesPreviousMapping: Bool = false, disableResidual: Bool = false) {
             self.rpuParams = rpuParams
             self.elPacket = elPacket
             self.rpuData = rpuData
             self.convertedRpu = convertedRpu
+            self.baseLayerRpu = baseLayerRpu
             self.isFEL = isFEL
             self.isMEL = isMEL
             self.success = success
@@ -140,10 +146,54 @@ public enum DoviRpuConverter {
     /// picture is finished. Mode 2 sets both curves to no-op (and drops the EL/NLQ part) while keeping
     /// L1/L2 and the rest of the display metadata; an RPU that kept the mapping would make the display
     /// side reshape a second time. `DoviComposedFrameRpuTests` pins this on the RPU attached to composed frames.
-    static func convertedUnspec62(_ rpu: OpaquePointer) -> UnsafePointer<DoviData>? {
+    ///
+    /// `removeMapping` makes the no-op curves certain for the dual-layer route's composed frames. Mode 2 sets
+    /// them to no-op only when the RPU's own `el_type` is FEL, and that comes from the NLQ block, which is
+    /// absent when `disable_residual_flag` is set: such an RPU keeps its curves through mode 2, and the display
+    /// would reshape a picture the composer already reshaped. The remux route leaves it off, because the frames
+    /// it writes are the raw base layer, which the display does have to reshape.
+    /// Only the `DualLayerDolbyVision` trait builds the removal: without it the parameter is ignored and the call is never made.
+    static func convertedUnspec62(
+        _ rpu: OpaquePointer,
+        removeMapping: Bool = false,
+        keepMapping: Bool = false,
+        rewrite: ((OpaquePointer) -> Bool)? = nil
+    ) -> UnsafePointer<DoviData>? {
+        // Mode 2 drops the mapping of an FEL RPU only; mode 1 first turns it into an MEL one, so the stream's
+        // own curves (MMR chroma included) survive the conversion. An RPU mode 1 refuses keeps the plain path.
+        if keepMapping { _ = dovi_convert_rpu_with_mode(rpu, 1) }
+        guard dovi_convert_rpu_with_mode(rpu, 2) == 0 else { return nil }
+        // libdovi validates a curve before it touches the RPU, so a refused rewrite leaves the converted mapping.
+        if let rewrite { _ = rewrite(rpu) }
+        #if DualLayerDolbyVision
+        if removeMapping {
+            guard dovi_rpu_remove_mapping(rpu) == 0 else { return nil }
+        }
+        #endif
+        return dovi_write_unspec62_nalu(rpu)
+    }
+
+    #if DualLayerDolbyVision
+    /// The Profile 8.1 form of the RPU in `nal` that keeps its luma/chroma mapping, as an unspec62 NAL, or nil
+    /// when libdovi refuses a step. This is what a frame shown as its raw base layer carries: nothing composed
+    /// it, so the display side has to reshape it, which the mode 2 form (`convertedUnspec62`, both curves set to
+    /// no-op) would stop it doing. Parses `nal` afresh, because the parsed RPU the caller holds has already been
+    /// converted to the other form.
+    ///
+    /// Mode 2 removes the mapping only when the RPU's own `el_type` is FEL, so a FEL RPU goes through mode 1
+    /// first: its NLQ becomes MEL's, the recomputed `el_type` is MEL, and mode 2 then drops the EL part and
+    /// leaves the curves alone. Mode 4 ("preserving mapping") is not used: on the FEL fixture it rewrites the
+    /// luma curve into a different one (`DoviComposedFrameRpuTests` compares the curves with the source).
+    static func mappingPreservedUnspec62(_ nal: UnsafePointer<UInt8>, _ len: Int, isFEL: Bool) -> UnsafePointer<DoviData>? {
+        guard let rpu = DoviRpuGuard.parse(nal, len) else { return nil }
+        defer { dovi_rpu_free(rpu) }
+        if isFEL {
+            guard dovi_convert_rpu_with_mode(rpu, 1) == 0 else { return nil }
+        }
         guard dovi_convert_rpu_with_mode(rpu, 2) == 0 else { return nil }
         return dovi_write_unspec62_nalu(rpu)
     }
+    #endif
 
     /// Splits a Profile 7 packet into its layers in one walk.
     ///
@@ -161,7 +211,9 @@ public enum DoviRpuConverter {
         framing: VideoNALFraming = .lengthPrefixed(size: 4),
         extractEL: Bool = true,
         useCustomBlockSource: Bool = false,
-        extractParams: Bool = true
+        extractParams: Bool = true,
+        keepMapping: Bool = false,
+        rpuRewrite: ((OpaquePointer) -> Bool)? = nil
     ) -> DualLayerPacketResult {
         let untouched = DualLayerPacketResult(elPacket: nil, rpuData: nil, isFEL: false, success: true)
         guard let data = packet.pointee.data, packet.pointee.size > 4 else { return untouched }
@@ -179,6 +231,7 @@ public enum DoviRpuConverter {
         var convertedRpuBytes: [UInt8]?
         #if DualLayerDolbyVision
         var rpuParams: DoviMetalParams?
+        var baseLayerRpuBytes: [UInt8]?
         #endif
         var converted = false
         var isFEL = false
@@ -225,7 +278,13 @@ public enum DoviRpuConverter {
                     // not flip the stream classification.
                     dovi_rpu_free_header(hdr)
                 }
-                guard let out = Self.convertedUnspec62(rpu) else {
+                #if DualLayerDolbyVision
+                let composedForm = keepRpuBytes
+                #else
+                let composedForm = false
+                #endif
+                guard let out = Self.convertedUnspec62(rpu, removeMapping: composedForm, keepMapping: keepMapping,
+                                                      rewrite: rpuRewrite) else {
                     degraded = true
                     return
                 }
@@ -234,6 +293,17 @@ public enum DoviRpuConverter {
                     degraded = true
                     return
                 }
+                #if DualLayerDolbyVision
+                // Parsed again for the mapping-preserved form: the RPU in hand is converted to mode 2 now.
+                // A refusal leaves the frame with no such form, and a bypass then falls back to the mode 2 one.
+                var thisBaseLayer: [UInt8]?
+                if keepRpuBytes, let b = Self.mappingPreservedUnspec62(nal, len, isFEL: thisFEL) {
+                    defer { dovi_data_free(b) }
+                    if let d = b.pointee.data, b.pointee.len > 0 {
+                        thisBaseLayer = [UInt8](UnsafeBufferPointer(start: d, count: b.pointee.len))
+                    }
+                }
+                #endif
                 rewritten.append(out)
                 if !useCustomBlockSource {
                     pieces.append(Piece(base: outData, count: out.pointee.len))
@@ -244,6 +314,7 @@ public enum DoviRpuConverter {
                 convertedRpuBytes = keepRpuBytes ? [UInt8](UnsafeBufferPointer(start: outData, count: out.pointee.len)) : nil
                 #if DualLayerDolbyVision
                 rpuParams = thisParams
+                baseLayerRpuBytes = thisBaseLayer
                 #endif
                 usesPrevious = thisPrevious
                 disableResidual = thisDisableResidual
@@ -313,6 +384,7 @@ public enum DoviRpuConverter {
             elPacket: producedElPacket,
             rpuData: rawRpuBytes,
             convertedRpu: convertedRpuBytes,
+            baseLayerRpu: baseLayerRpuBytes,
             rpuParams: rpuParams,
             isFEL: isFEL && !isMEL,
             isMEL: isMEL,
@@ -351,6 +423,17 @@ public enum DoviRpuConverter {
         framing: VideoNALFraming = .lengthPrefixed(size: 4)
     ) -> Bool {
         separateDualLayers(packet, framing: framing, extractEL: false, extractParams: false).success
+    }
+
+    /// `convertPacketToProfile81` that keeps the stream's mapping (an FEL RPU's included) and runs `rewrite`
+    /// on the RPU after the conversion and before it is written (`FelCurve.apply`), for the curve fold.
+    static func convertPacketToProfile81KeepingMapping(
+        _ packet: UnsafeMutablePointer<AVPacket>,
+        framing: VideoNALFraming,
+        rewrite: ((OpaquePointer) -> Bool)?
+    ) -> Bool {
+        separateDualLayers(packet, framing: framing, extractEL: false, extractParams: false,
+                           keepMapping: true, rpuRewrite: rewrite).success
     }
 
     /// Enhancement-layer type ("FEL" or "MEL") of the first unspec62 RPU in a P7 packet, or nil if

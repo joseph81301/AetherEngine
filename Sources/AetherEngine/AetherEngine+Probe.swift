@@ -192,9 +192,26 @@ extension AetherEngine {
                     ownedReader = reader
                     let counted = ProbeIOReader(reader: reader, control: control)
                     try control.check()
-                    if let http = reader as? ProbeHTTPReader { try http.open() }
+                    var isDASHManifest = false
+                    if let http = reader as? ProbeHTTPReader {
+                        do {
+                            try http.open()
+                        } catch AVIOReaderError.dashManifest {
+                            isDASHManifest = true
+                        }
+                    }
                     try control.check()
-                    try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits))
+                    if isDASHManifest {
+                        // AE#859: an MPD is opened by the demuxer's own DASH path, which reads several
+                        // files. Deadline and cancellation are honoured inside libavformat's reads
+                        // through the demuxer's interrupt, but the manifest and head requests run to
+                        // their own timeouts, and the byte budget, which counts one source, does not apply.
+                        reader.close()
+                        ownedReader = nil
+                        try demuxer.open(url: u, extraHeaders: options.httpHeaders)
+                    } else {
+                        try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits))
+                    }
                 } else {
                     try demuxer.open(url: u, extraHeaders: options.httpHeaders)
                 }
@@ -545,15 +562,31 @@ extension AetherEngine {
     enum LoadDisplayCriteriaAction {
         /// Engine-writer video path: apply() overwrites the preserved criteria in place, single handshake.
         case applyFresh
-        /// No engine apply() this session (audio-only, or an AVKit-sole-writer host): clear a criteria a
+        /// No engine apply() this session (audio-only, or criteria owned by AVKit or the host): clear a criteria a
         /// previous session left applied, so it can't keep the panel in DV/HDR under music playback or
         /// fight AVKit's own write. `DisplayCriteriaController.reset()` stays didApply-gated, so this is
         /// a no-op for hosts that never route criteria through the engine.
         case clearStale
     }
 
-    nonisolated static func loadDisplayCriteriaAction(suppressDisplayCriteria: Bool, audioOnlyPath: Bool) -> LoadDisplayCriteriaAction {
-        (suppressDisplayCriteria || audioOnlyPath) ? .clearStale : .applyFresh
+    nonisolated static func loadDisplayCriteriaAction(engineWritesCriteria: Bool, audioOnlyPath: Bool) -> LoadDisplayCriteriaAction {
+        (!engineWritesCriteria || audioOnlyPath) ? .clearStale : .applyFresh
+    }
+
+    /// AE#348: whether the pre-flight gate after an HDR/DV write runs beside the load rather than in front
+    /// of it.
+    ///
+    /// The gate guards the routing read (master or media, from the settled panel) and the AVPlayerItem,
+    /// not the segment production in front of them: `HLSVideoEngine.prepare()` reads nothing about the
+    /// panel. Serialising the two put a ~96 Mbit/s title's first two segments (2.0 s to cut) behind a
+    /// switch that ended 1.5 s before playback started (Apple TV 4K, DV, badrabbit 2026-10-16). The gate
+    /// still starts at the write and the routing read still waits for it, so the read is never taken
+    /// earlier than before.
+    ///
+    /// Live keeps the serial order: its join and rejoin are timed against the edge, and the overlap has not
+    /// been measured there.
+    nonisolated static func preflightGateRunsBesideLoad(isLive: Bool) -> Bool {
+        !isLive
     }
 
     /// #274: how long the post-load play-gate blind-polls for a panel switch to start.
@@ -571,6 +604,9 @@ extension AetherEngine {
     ///   rate-only, and the engine already declines to gate its own rate-only writes (`apply()` returns
     ///   `.applied` with no pre-flight wait) because those switches are sub-second.
     ///
+    /// AE#842: a host-owned session counts as written-before-load too. The host wrote its criteria (or none)
+    /// before calling `load()`, so like the engine's own write there is nothing inbound to blind-poll for.
+    ///
     /// `formatKnown` is false when the open-time probe failed: the real range is then unknown and a DV write
     /// may still be inbound, so a suppressed host keeps the full budget.
     ///
@@ -578,14 +614,14 @@ extension AetherEngine {
     /// no inbound switch to wait for.
     nonisolated static func playGateGrace(
         criteriaUnchanged: Bool,
-        engineIsCriteriaWriter: Bool,
+        criteriaWrittenBeforeLoad: Bool,
         formatKnown: Bool,
         effectiveFormat: VideoFormat,
         noWriterExpected: Bool = false
     ) -> DisplayCriteriaController.StartGrace {
         // #133: the criteria were already active, nothing was written, nothing can settle.
         if criteriaUnchanged || noWriterExpected { return .skip }
-        if engineIsCriteriaWriter { return .brief }
+        if criteriaWrittenBeforeLoad { return .brief }
         guard formatKnown else { return .full }
         return effectiveFormat == .sdr ? .brief : .full
     }
@@ -595,6 +631,7 @@ extension AetherEngine {
         guard options.sharedOutputRole == .secondary else { return options }
         var adjusted = options
         adjusted.suppressDisplayCriteria = true
+        adjusted.displayCriteriaOwner = .engine
         return adjusted
     }
 
@@ -625,6 +662,52 @@ extension AetherEngine {
         }
     }
 
+    /// Whether an audio-only session goes to AVPlayer (`AudioAVPlayerHost`) rather than libavcodec
+    /// (`AudioPlaybackHost`). AVPlayer needs a URL it can read and a codec on the whitelist, and
+    /// takes neither a FLAC whose blocks are under CoreMedia's floor (AE#764), nor a FLAC whose frames
+    /// are smaller than `STREAMINFO`'s `max_blocksize` (AE#946, AVPlayer mistimes it), nor a raw FLAC
+    /// file (AE#946, AVPlayer seeks it to the wrong place), nor a session the host asked onto `.software`.
+    nonisolated static func audioOnlyUsesAVPlayer(
+        codecID: AVCodecID,
+        isCustomSource: Bool,
+        flacBlocksTooSmall: Bool,
+        flacFramesMistimed: Bool,
+        flacSeeksMisplaced: Bool,
+        preferred: DecodePath
+    ) -> Bool {
+        !isCustomSource && avPlayerCanDecodeAudio(codecID) && !flacBlocksTooSmall && !flacFramesMistimed
+            && !flacSeeksMisplaced && preferred != .software
+    }
+
+    /// AE#946: CoreMedia's parser for the raw FLAC container ignores `SEEKTABLE` and places a seek by
+    /// an estimated byte rate, then stamps the requested time on whatever frame it reached. On real
+    /// music that lands seconds early (a 96/24 track with a quiet intro: 120 s played from 100.3 s,
+    /// reported as 120 s), so the clock runs ahead of the sound and the track ends while it is still
+    /// playing. Playback from zero is exact, and FLAC inside MP4 (`dfLa`) seeks exactly; only the
+    /// bare `flac` container is affected, whatever encoder wrote it.
+    nonisolated static func coreMediaMisplacesSeeks(codecID: AVCodecID, containerFormatName: String?) -> Bool {
+        codecID == AV_CODEC_ID_FLAC && containerFormatName == "flac"
+    }
+
+    /// AE#946: how many packets the audio-only dispatch looks through for the first FLAC frame. An
+    /// attached cover picture is delivered as a packet ahead of the audio.
+    static let flacFramePeekPacketBudget = 8
+
+    /// AE#946: the block size of `streamIndex`'s first FLAC frame, peeked without consuming it (the FFmpeg
+    /// host reuses this demuxer and reads the same packets). nil when no fixed-blocksize frame turned up.
+    static func firstFLACFrameBlockSize(demuxer: Demuxer, streamIndex: Int32) -> UInt16? {
+        var blockSize: UInt16?
+        try? demuxer.peekPackets(maxPackets: flacFramePeekPacketBudget) { packet in
+            guard packet.pointee.stream_index == streamIndex else { return false }
+            if let data = packet.pointee.data, packet.pointee.size > 0 {
+                blockSize = FLACStreamInfo.fixedStrategyFrameBlockSize(
+                    UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+            }
+            return true
+        }
+        return blockSize
+    }
+
     // MARK: - Audio track selection (#72)
 
     /// Resolve the audio stream index selected by an explicit host `override` or, failing that, the
@@ -643,11 +726,16 @@ extension AetherEngine {
         if let override, tracks.contains(where: { $0.id == Int(override) }) {
             return override
         }
-        // #731: with object rendering on, TrueHD Atmos and DTS:X keep their heights, which no other
-        // track of the same language does better, so they win ties within a language. Never across one.
-        let atmosRank: ((Int) -> Int)? = prefersObjectAudio
-            ? { isRenderableObjectAudio(tracks[$0]) ? 0 : 1 }
-            : nil
+        // AE#919: within a language the programme mix wins over audio description and commentary, which a
+        // file may list first. #731: with object rendering on, TrueHD Atmos and DTS:X keep their heights,
+        // which no other track of the same language does better, so they win the remaining ties. Never
+        // across a language.
+        let secondaryRank: (Int) -> Int = { index in
+            let track = tracks[index]
+            let descriptorRank = track.isVisualImpaired || track.isCommentary ? 1 : 0
+            let atmosRank = prefersObjectAudio && !isRenderableObjectAudio(track) ? 1 : 0
+            return descriptorRank * 2 + atmosRank
+        }
         // Each preference is scanned across all tracks in order, so an earlier preference on a later
         // track still beats a later preference on an earlier track. Within one preference the most
         // specific tag wins, so an "en-GB" preference takes en-GB over eng over en-US (#590).
@@ -655,7 +743,7 @@ extension AetherEngine {
             languages: tracks.map(\.language),
             preferredLanguages: preferredLanguages,
             kind: .audio,
-            secondaryRank: atmosRank
+            secondaryRank: secondaryRank
         ) {
             return Int32(tracks[index].id)
         }
@@ -665,9 +753,15 @@ extension AetherEngine {
         // another dub, not another format of this one.
         guard prefersObjectAudio,
               let fallback = tracks.first(where: { $0.id == Int(defaultIndex) }),
-              !isRenderableObjectAudio(fallback),
-              let language = fallback.language
+              !isRenderableObjectAudio(fallback)
         else { return nil }
+        // With no track tagged at all (`und`, empty, none) there is nothing to tell dubs apart by, and
+        // demo discs like Dolby's Unfold tag nothing and list the E-AC-3 JOC as the probe's best stream.
+        // One tagged track is enough to show the file names its dubs, so the default then stays.
+        guard let language = fallback.language, LanguageTag(language) != nil else {
+            guard tracks.allSatisfy({ LanguageTag($0.language) == nil }) else { return nil }
+            return tracks.first(where: isRenderableObjectAudio).map { Int32($0.id) }
+        }
         let candidates = tracks.compactMap { track -> (track: TrackInfo, rank: Int)? in
             guard isRenderableObjectAudio(track),
                   let rank = languageMatchRank(track.language, language, kind: .audio),
@@ -679,22 +773,26 @@ extension AetherEngine {
     }
 
     /// TrueHD that FFmpeg marked Atmos while probing (mlpdec sets the profile from the major sync), and
-    /// not a commentary. `TrackInfo.isAtmos` stays the E-AC-3 JOC answer it is documented as.
+    /// not a commentary or an audio description. `TrackInfo.isAtmos` stays the E-AC-3 JOC answer it is
+    /// documented as.
     nonisolated static func isRenderableTrueHDAtmos(_ track: TrackInfo) -> Bool {
-        linksTrueHDObjectDecoder && track.codec.lowercased() == "truehd" && !track.isCommentary && !track.isExternal
+        linksTrueHDObjectDecoder && track.codec.lowercased() == "truehd"
+            && !track.isCommentary && !track.isVisualImpaired && !track.isExternal
             && track.profile == trueHDAtmosProfileName
     }
 
     nonisolated private static let trueHDAtmosProfileName =
         VideoStreamFormat.profileName(codecID: AV_CODEC_ID_TRUEHD, profile: AV_PROFILE_TRUEHD_ATMOS)
 
-    /// DTS that FFmpeg labelled DTS:X while probing, and not a commentary. FFmpeg names only two of
-    /// DTS:X's markers, so a DTS-HD MA track it labels plain can be DTS:X as well; that one is still
-    /// rendered when it is the track that plays, but only the label can be ranked before playback.
+    /// DTS that FFmpeg labelled DTS:X while probing, and not a commentary or an audio description. FFmpeg
+    /// names only two of DTS:X's markers, so a DTS-HD MA track it labels plain can be DTS:X as well; that
+    /// one is still rendered when it is the track that plays, but only the label can be ranked before
+    /// playback.
     /// `TrackInfo.codec` is the decoder's name, `dca` for libavcodec's DTS decoder; `dts` is the
     /// codec's own name, which a build without the decoder would report.
     nonisolated static func isRenderableDTSX(_ track: TrackInfo) -> Bool {
-        linksDTSXObjectDecoder && ["dca", "dts"].contains(track.codec.lowercased()) && !track.isCommentary && !track.isExternal
+        linksDTSXObjectDecoder && ["dca", "dts"].contains(track.codec.lowercased())
+            && !track.isCommentary && !track.isVisualImpaired && !track.isExternal
             && dtsxProfileNames.contains(track.profile ?? "")
     }
 
@@ -730,6 +828,22 @@ extension AetherEngine {
             secondaryRank: { subtitlePickRank(tracks[$0]) }
         ) else { return nil }
         return Int32(tracks[index].id)
+    }
+
+    /// The subtitle track to activate at the end of a load: `LoadOptions.initialSubtitleTrackID` when it
+    /// names a track in `tracks`, else the best `preferredSubtitleLanguages` match, else nil (subtitles
+    /// off). The explicit id wins because a host that names a track has already made the choice the
+    /// language ranking approximates; an id that matches nothing is ignored rather than treated as an
+    /// error, so a stale server index cannot fail a load. Pure and nonisolated, like `selectSubtitleIndex`.
+    nonisolated static func resolveInitialSubtitleIndex(
+        tracks: [TrackInfo],
+        initialTrackID: Int?,
+        preferredLanguages: [String]
+    ) -> Int32? {
+        if let initialTrackID, tracks.contains(where: { $0.id == initialTrackID }) {
+            return Int32(initialTrackID)
+        }
+        return selectSubtitleIndex(tracks: tracks, preferredLanguages: preferredLanguages)
     }
 
     /// Lower rank wins. The descriptor axis (full > SDH > forced > commentary, from container dispositions)
@@ -827,19 +941,30 @@ extension AetherEngine {
         return "VideoToolbox \(name) (HW)"
     }
 
-    /// User-facing label for the active audio decoder on the SW path (libavcodec -> CoreAudio). nil when
-    /// no audio track. AE#462: `activeIndex` is the HOST's resolved index, never the engine's pick. The
-    /// pick says which track was asked for; a session whose decoder refused to open serves none, and
-    /// this label used to name one for it.
+    /// User-facing label for the active audio pipeline on the SW path. nil when no audio track. AE#462:
+    /// `activeIndex` is the HOST's resolved index, never the engine's pick. The pick says which track was
+    /// asked for; a session whose decoder refused to open serves none, and this label used to name one
+    /// for it. `route` is the host's `audioRoute`: the PCM decode is libavcodec into CoreAudio, the Atmos
+    /// routes are named the way the loopback route names its own APAC ("TRUEHD Atmos → APAC 7.1.4").
     nonisolated static func softwareAudioDecoderLabel(
         audioTracks: [TrackInfo],
-        activeIndex: Int32
+        activeIndex: Int32,
+        route: SoftwareAtmosRoute = .pcm
     ) -> String? {
         guard activeIndex >= 0,
               let track = audioTracks.first(where: { $0.id == Int(activeIndex) }) else {
             return nil
         }
-        return "libavcodec \(track.codec.uppercased()) → CoreAudio"
+        let codec = track.codec.uppercased()
+        switch route {
+        case .pcm: return "libavcodec \(codec) → CoreAudio"
+        case .compressedEAC3JOC: return "\(codec) Atmos → renderer (compressed)"
+        case .decodedEAC3JOC(let layout): return "\(codec) Atmos → PCM \(layout.rawValue) (system decoder)"
+        case .apac(let layout):
+            return codec.hasPrefix("DTS") ? "DTS:X → APAC \(layout.rawValue)" : "\(codec) Atmos → APAC \(layout.rawValue)"
+        case .pcmBed(let layout):
+            return codec.hasPrefix("DTS") ? "DTS:X → PCM \(layout.rawValue)" : "\(codec) Atmos → PCM \(layout.rawValue)"
+        }
     }
 
     // MARK: - Format / frame-rate probing
@@ -1037,14 +1162,13 @@ extension AetherEngine {
         hostAsserts: Bool,
         criteriaReadoutAtLoad: Bool?,
         attemptWhenUnproven: Bool,
-        isLive: Bool,
         displayEligibleForHDR: Bool,
         panelRefusedHDRMaster: Bool
     ) -> Bool {
         sessionRoutesAsHDRPanel(
             panelPresentsHDR: sessionPanelPresentsHDR(
                 hostAsserts: hostAsserts, criteriaReadout: criteriaReadoutAtLoad),
-            attemptWhenUnproven: attemptWhenUnproven && !isLive,
+            attemptWhenUnproven: attemptWhenUnproven,
             displayEligibleForHDR: displayEligibleForHDR,
             panelRefusedHDRMaster: panelRefusedHDRMaster)
     }

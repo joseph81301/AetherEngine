@@ -1,3 +1,5 @@
+import AVFoundation
+import Combine
 import Testing
 @testable import AetherEngine
 
@@ -180,10 +182,45 @@ struct SampleBufferRendererLookaheadTests {
         #expect(abs(r.lead - 4 * frame) < 1e-9)
     }
 
+    @Test("A frame 100 s ahead of the clock is held until the clock reaches it")
+    func forwardJumpIsHeld() {
+        let frame = 1.0 / 24
+        let maxLead = SampleBufferRenderer.maxReorderPictures * frame
+        let lead = 3 * frame
+        // 100 s on from the highest PTS seen: the lead is kept and the gate refuses the frame.
+        let d = SampleBufferRenderer.displayOrderPTS(packetPTS: 200, maxSeenPTS: 100, reorderLead: lead, maxLead: maxLead)
+        #expect(d.maxSeen == 200)
+        #expect(d.lead == lead)
+        #expect(!mayEnqueue(rate: 24, pts: d.pts, clock: 100))
+        #expect(mayEnqueue(rate: 24, pts: d.pts, clock: 200))
+    }
+
     #if DualLayerDolbyVision
     @Test("The pool threshold follows the look-ahead cap")
     func poolFollowsCap() {
         #expect(DoviFelComposer.outputPoolAllocationThreshold == SampleBufferRenderer.felVideoLookaheadFrames + 2 + DoviFelComposer.maxFramesInFlight + 1)
+    }
+
+    @Test("The pool threshold follows the in-flight limit; the reserve is independent of it")
+    func poolThresholdFollowsInFlightLimitAndReserveDoesNot() {
+        let inFlight = DoviFelComposer.maxFramesInFlight
+        let threshold = DoviFelComposer.outputPoolAllocationThreshold
+        // On screen, retained by the display layer, the in-flight compositions, one spare.
+        #expect(threshold == SampleBufferRenderer.felVideoLookaheadFrames + 2 + inFlight + 1)
+        // The reserve is sized from the measured burst shortfall, not from the slots.
+        #expect(DoviFelComposer.outputPoolReserve == 3)
+        // The pool's hard cap at the current constants: 9 look-ahead + 2 + 2 in flight + 1, plus the reserve of 3.
+        #expect(threshold + DoviFelComposer.outputPoolReserve == 17)
+    }
+
+    @Test("The compose check fires only when mean GPU time exceeds the frame interval")
+    func composeCannotKeepUpCheck() {
+        #expect(!DualLayerVideoDecoder.composeCannotKeepUp(meanGpuMs: 12.7, frameRate: 23.976))
+        #expect(!DualLayerVideoDecoder.composeCannotKeepUp(meanGpuMs: 41.0, frameRate: 23.976))
+        #expect(DualLayerVideoDecoder.composeCannotKeepUp(meanGpuMs: 42.0, frameRate: 23.976))
+        #expect(DualLayerVideoDecoder.composeCannotKeepUp(meanGpuMs: 17.0, frameRate: 60))
+        #expect(!DualLayerVideoDecoder.composeCannotKeepUp(meanGpuMs: 100, frameRate: nil))
+        #expect(!DualLayerVideoDecoder.composeCannotKeepUp(meanGpuMs: 100, frameRate: 0))
     }
     #endif
 
@@ -193,4 +230,31 @@ struct SampleBufferRendererLookaheadTests {
             rendererReady: ready, felFrameRate: rate, framePTS: pts,
             clockSeconds: clock, clockArmed: armed)
     }
+    @MainActor
+    @Test("resume flushes a failed queue before publishing play")
+    func failedQueueRecoversBeforePlay() {
+        var events: [String] = []
+        let renderer = SampleBufferRenderer(resumeQueue: .init(
+            status: { .failed }, flush: { events.append("flush") }))
+        let host = SoftwarePlaybackHost(renderer: renderer)
+        let observation = host.$rate.dropFirst().sink { rate in
+            if rate > 0 { events.append("play") }
+        }
+        host.play()
+        #expect(events == ["flush", "play"])
+        #expect(host.isPlaying)
+        observation.cancel()
+        host.stop()
+    }
+
+    @MainActor
+    @Test("resume preserves a healthy full queue's frames", arguments: [AVQueuedSampleBufferRenderingStatus.unknown, .rendering])
+    func healthyQueueIsNotFlushed(status: AVQueuedSampleBufferRenderingStatus) {
+        var flushes = 0
+        let renderer = SampleBufferRenderer(resumeQueue: .init(
+            status: { status }, flush: { flushes += 1 }))
+        renderer.recoverAfterSuspensionIfNeeded()
+        #expect(flushes == 0)
+    }
+
 }

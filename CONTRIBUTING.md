@@ -44,6 +44,12 @@ gets a real thread (`Thread.detachNewThread`), never `DispatchQueue.global().asy
 192 pool workers blocked, which is what a full parallel run of this suite produces, the queue had
 not started the block after 35 seconds while a detached thread ran in 3 milliseconds.
 
+CI enforces the two mechanical halves of this with `Scripts/check-test-hygiene.py`: no
+`try? await Task.sleep` and no `DispatchQueue.global().async` (or `asyncAfter`) anywhere under
+`Tests/`. A line that is a real exception says why, with `// hygiene: allow <reason>` on it. The
+same script rejects a `.timeLimit` under two minutes: a green run has hundreds of tests above 60 s,
+so a one minute limit reported healthy tests as hangs. Use `.minutes(3)`.
+
 **A blocking syscall in a test is unreachable for the `.timeLimit` trait, so it may not sit on the
 test's own thread.** Cancellation in Swift is cooperative: a test parked in `read`, `accept` or
 `waitUntilExit` never observes it, the trait never reports, and the job dies at its own
@@ -65,6 +71,7 @@ A bug that reproduces in a host app but traces back to decoding, demuxing, the a
 - Update `CHANGELOG.md`, and the documentation in the same commit (see below; three tests enforce parts of this, so a PR that skips it fails rather than merges).
 - Follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat(audio):`, `fix(muxer):`, `chore(deps):`, and so on).
 - Treat `internal` types and properties as private; they are not part of the public contract and can change in any release.
+- Every pull request that is not a draft gets an automated first-pass review (Claude, rules in [.github/claude/review.md](.github/claude/review.md)) when it opens and after each push. It reads the code and does not run it; it is advisory, and a human still reviews and merges. New issues get automatic labels and, when information is missing, one comment asking for it.
 
 ## Documentation, and the tests that hold it to the code
 

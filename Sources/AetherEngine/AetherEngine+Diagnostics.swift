@@ -4,6 +4,38 @@ import AVFoundation
 
 extension AetherEngine {
 
+    /// Reads presentation evidence from the active local video pipeline, without waiting for a frame.
+    /// Native readiness can briefly fall during item swaps. Software metrics count non-dropped frames
+    /// cumulatively and do not prove a picture survived a flush. Hosts may latch a true for startup,
+    /// but must not treat a false as a request to restore a poster or as evidence of lost playback.
+    /// Unavailable metrics (including visionOS 1.0), cancellation and a superseded session return false.
+    public func hasRenderedVideoFrame() async -> Bool {
+        await hasRenderedVideoFrame(readSoftwareMetrics: { await $0.loadRenderMetrics() })
+    }
+
+    // Keep the asynchronous read injectable so a replacement load can be tested while it is pending.
+    func hasRenderedVideoFrame(
+        readSoftwareMetrics: @MainActor (SoftwarePlaybackHost) async -> SampleBufferRenderer.RenderMetrics?
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        switch playbackBackend {
+        case .native:
+            // A reused layer may still hold the outgoing item's picture until the next load mounts.
+            return hasFirstFrameReadyForDisplay && nativeHost?.playerLayer.isReadyForDisplay == true
+        case .software:
+            guard let host = softwareHost else { return false }
+            let generation = loadGeneration
+            guard let metrics = await readSoftwareMetrics(host),
+                  !Task.isCancelled, loadGeneration == generation,
+                  playbackBackend == .software, softwareHost === host else { return false }
+            // Each software host owns one renderer for its lifetime, so host identity also fences
+            // the surface whose asynchronous counters answered.
+            return metrics.total > metrics.dropped
+        case .none, .audio, .aether:
+            return false
+        }
+    }
+
     /// #220 diagnostic opt-in: appends a live large-block census (blocks >= 1 MB, bucketed by
     /// size class) to the 30 s memprobe line. A flat `mallocBlocks` with a rising `mallocMB`
     /// identifies "one large buffer is growing" but not which one; the census names the size
@@ -219,6 +251,8 @@ extension AetherEngine {
         HTTPDiscIOReader.resetLifetimeFetchedBytes()
         // #134: currentTime()/loadedTimeRanges are sync XPC reads; hop them off the main actor.
         let probeReadQueue = DispatchQueue(label: "engine.memprobe.avfread", qos: .utility)
+        let cpuSampler = ThreadCPUSampler()
+        _ = cpuSampler.sample()
         memoryProbeTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
@@ -367,6 +401,9 @@ extension AetherEngine {
                     + "seams=\(self.presentationAxis.seams.count)"
 
                 EngineLog.emit(line, category: .engine)
+                if let cpu = cpuSampler.sample() {
+                    EngineLog.emit("[AetherEngine] cpuprobe t=\(elapsed)s " + cpu.logFragment(), category: .engine)
+                }
 
                 // #250: the steady-state cadence for the subtitle-resolution statement. It rides
                 // the memprobe rather than the 2 Hz drain tick because it states a span, and a
@@ -487,6 +524,25 @@ extension AetherEngine {
     }
 
     // MARK: - Live telemetry bridge
+
+    /// Lifecycle callbacks can arrive after stop or a new load. Only cleanup may publish after
+    /// the owning session has detached; the token still prevents it crossing into its successor.
+    func acceptSessionCacheStatus(_ status: SessionCacheStatus, token: UInt64) {
+        guard token == sessionCacheStatusToken else { return }
+        guard status.cleanupResult != .notRun || nativeVideoSession != nil else { return }
+        diagnostics.sessionCacheStatus = status
+    }
+
+    /// Read the cache ledger off-main. An old tick must never overwrite a new session or cleanup.
+    func refreshSessionCacheStatus() async {
+        guard let session = nativeVideoSession else { return }
+        let token = sessionCacheStatusToken
+        let generation = loadGeneration
+        let status = await BlockingWork.detached(priority: .utility) { session.sessionCacheStatus() }.value
+        guard !Task.isCancelled, sessionCacheStatusToken == token, loadGeneration == generation,
+              nativeVideoSession === session else { return }
+        diagnostics.sessionCacheStatus = status
+    }
 
     /// Single write-through point: sampler never reaches into `EngineDiagnostics` directly.
     func applyLiveTelemetry(_ snapshot: LiveTelemetry) {

@@ -1,33 +1,55 @@
-// Only with the DTSXObjectAudio trait (off by default): the decoder and its library are not built without it.
+// Only with the DTSXObjectAudio trait (off by default): the decoder is not built without it.
 #if DTSXObjectAudio
 import Testing
 import Foundation
-import DTSX
+import AetherLibavutil
 @testable import AetherEngine
 
-/// LibDTSX returns DTS:X's standard presentation only, and `DTSXObjectAudioDecoder` names its
-/// channels. These pin what a listener would hear wrong: a bed or height channel on the wrong
-/// speaker, or a channel outside the twelve slipping through to be panned.
+/// FFmpeg's dca decoder returns DTS:X's standard presentation as 7.1.4 (FFmpegBuild's `x_heights`
+/// patch), and `DTSXObjectAudioDecoder` names its channels and the heights' folds into the bed. These
+/// pin what a listener would hear wrong: a bed or height channel on the wrong speaker, a height taken
+/// out of the wrong bed channel, or a channel outside the twelve slipping through to be panned.
 @Suite("DTS:X channels map onto the renderer's speakers")
 struct DTSXObjectMetadataMappingTests {
 
-    @Test("bed and height speaker codes route to the matching speaker, LFE to LFE, nothing else is taken")
+    @Test("bed and height channels route to the matching speaker, LFE to LFE")
     func speakerRoles() {
-        // The standard DTS:X presentation: a 7.1 bed and the top front and top back pairs.
-        let standard: [(UInt8, ObjectAudioRole)] = [
-            (DTSX_SPEAKER_C, .bed(.center)), (DTSX_SPEAKER_L, .bed(.left)), (DTSX_SPEAKER_R, .bed(.right)),
-            (DTSX_SPEAKER_LS, .bed(.sideLeft)), (DTSX_SPEAKER_RS, .bed(.sideRight)), (DTSX_SPEAKER_LFE, .lfe),
-            (DTSX_SPEAKER_LB, .bed(.rearLeft)), (DTSX_SPEAKER_RB, .bed(.rearRight)),
-            (DTSX_SPEAKER_TFL, .bed(.topFrontLeft)), (DTSX_SPEAKER_TFR, .bed(.topFrontRight)),
-            (DTSX_SPEAKER_TBL, .bed(.topRearLeft)), (DTSX_SPEAKER_TBR, .bed(.topRearRight)),
+        let expected: [(AVChannel, ObjectAudioRole)] = [
+            (AV_CHAN_FRONT_CENTER, .bed(.center)), (AV_CHAN_FRONT_LEFT, .bed(.left)),
+            (AV_CHAN_FRONT_RIGHT, .bed(.right)), (AV_CHAN_SIDE_LEFT, .bed(.sideLeft)),
+            (AV_CHAN_SIDE_RIGHT, .bed(.sideRight)), (AV_CHAN_LOW_FREQUENCY, .lfe),
+            (AV_CHAN_BACK_LEFT, .bed(.rearLeft)), (AV_CHAN_BACK_RIGHT, .bed(.rearRight)),
+            (AV_CHAN_TOP_FRONT_LEFT, .bed(.topFrontLeft)), (AV_CHAN_TOP_FRONT_RIGHT, .bed(.topFrontRight)),
+            (AV_CHAN_TOP_BACK_LEFT, .bed(.topRearLeft)), (AV_CHAN_TOP_BACK_RIGHT, .bed(.topRearRight)),
         ]
-        for (code, role) in standard {
-            #expect(DTSXObjectAudioDecoder.role(forSpeaker: code) == role, "speaker \(code)")
+        #expect(DTSXObjectAudioDecoder.channels.count == expected.count)
+        for ((channel, role), (wantChannel, wantRole)) in zip(DTSXObjectAudioDecoder.channels, expected) {
+            #expect(channel == wantChannel && role == wantRole, "\(channel.rawValue)")
         }
-        for code in [DTSX_SPEAKER_OBJECT, DTSX_SPEAKER_UNKNOWN, DTSX_SPEAKER_LW, DTSX_SPEAKER_TSR,
-                     DTSX_SPEAKER_TFC, DTSX_SPEAKER_CB, DTSX_SPEAKER_LFE2] {
-            #expect(DTSXObjectAudioDecoder.role(forSpeaker: code) == nil, "speaker \(code)")
-        }
+    }
+
+    @Test("the bed is the first eight channels, the heights the elements, each folded into the one under it")
+    func bedAndFolds() {
+        #expect(DTSXObjectAudioDecoder.bedRoles == DTSXObjectAudioDecoder.channels.prefix(8).map(\.1))
+        #expect(DTSXObjectAudioDecoder.roles == [.bed(.topFrontLeft), .bed(.topFrontRight), .bed(.topRearLeft), .bed(.topRearRight)])
+        let under: [ObjectAudioRole] = DTSXObjectAudioDecoder.folds.map { DTSXObjectAudioDecoder.bedRoles[$0.plane] }
+        #expect(DTSXObjectAudioDecoder.folds.map(\.element) == [0, 1, 2, 3])
+        #expect(under == [.bed(.left), .bed(.right), .bed(.rearLeft), .bed(.rearRight)])
+        #expect(DTSXObjectAudioDecoder.folds.allSatisfy { $0.gain == 23170 / 32768 })
+    }
+
+    @Test("each presentation folds its heights at its profile's gain, and an unmeasured one has none")
+    func foldsByPresentation() {
+        let standard: Float = 23170 / 32768
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 1) == standard)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd0) == 1)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd1) == standard)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd3) == standard)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd4) == nil)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0) == nil)
+        #expect(DTSXObjectAudioDecoder.unityFolds.allSatisfy { $0.gain == 1 })
+        #expect(DTSXObjectAudioDecoder.unityFolds.map(\.plane) == DTSXObjectAudioDecoder.folds.map(\.plane))
+        #expect(DTSXObjectAudioDecoder.unityFolds.map(\.element) == DTSXObjectAudioDecoder.folds.map(\.element))
     }
 
     @Test("the standard channels play one to one on 7.1.4 and 9.1.6, and only there")
@@ -37,19 +59,12 @@ struct DTSXObjectMetadataMappingTests {
         }
     }
 
-    @Test("a channel plays at unity while active")
+    @Test("a channel plays at unity on its speaker")
     func channelState() {
-        var element = DTSXElement()
-        element.kind = DTSX_ELEMENT_BED
-        element.speaker = DTSX_SPEAKER_TFL
-        element.flags = DTSX_ELEMENT_ACTIVE
-        element.position = (0, 0, 1)
-        element.gain = 1
-        let state = DTSXObjectAudioDecoder.state(for: element)
-        #expect(state.position == SIMD3(0, 0, 1))
+        let state = DTSXObjectAudioDecoder.state(for: .bed(.topFrontLeft))
+        #expect(state.position == SpatialSpeaker.topFrontLeft.position)
         #expect(state.gain == 1)
-        element.flags = 0
-        #expect(DTSXObjectAudioDecoder.state(for: element).gain == 0)
+        #expect(DTSXObjectAudioDecoder.state(for: .lfe).gain == 1)
     }
 
     @Test("the decoder opens, takes input and asks for more")
@@ -57,22 +72,17 @@ struct DTSXObjectMetadataMappingTests {
         let decoder = try DTSXObjectAudioDecoder()
         try [UInt8](repeating: 0, count: 64).withUnsafeBytes { try decoder.push($0) }
         #expect(try decoder.nextBlock() == nil)
+        decoder.releaseHeldBlocks()
+        #expect(try decoder.nextBlock() == nil)
         decoder.reset()
         #expect(decoder.selfResetCount == 0)
     }
 
-    @Test("input with no DTS frame in it is refused, and the verdict says so")
-    func verdictRefusesNonDTS() throws {
+    @Test("input with no DTS frame in it gives no verdict, so the session keeps the channel bridge")
+    func verdictOnNonDTS() throws {
         let decoder = try DTSXObjectAudioDecoder()
-        let garbage = [UInt8](repeating: 0x55, count: 1 << 20 | 4096)
-        let verdict = garbage.withUnsafeBytes { decoder.verdict(feeding: $0) }
-        guard case .refused(let reason) = verdict else {
-            Issue.record("expected a refusal, got \(String(describing: verdict))")
-            return
-        }
-        #expect(reason.contains("no DTS frame"))
-        // The refusal sticks, so a bridge built on it anyway would fail rather than play nothing.
-        #expect(throws: DTSXObjectAudioDecoder.DecoderError.self) { try decoder.nextBlock() }
+        let garbage = [UInt8](repeating: 0x55, count: 1 << 20)
+        #expect(garbage.withUnsafeBytes { decoder.verdict(feeding: $0) } == nil)
     }
 }
 #endif

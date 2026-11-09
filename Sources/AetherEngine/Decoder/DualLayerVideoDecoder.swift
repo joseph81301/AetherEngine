@@ -17,10 +17,14 @@ import AetherLibavutil
 /// `OrderedDelivery.emit` runs on the delivery queue and does not reach
 /// into the decoder's frame state (`dmRpuCache`, the queues) itself. `HardwareVideoDecoder` passes
 /// `hdr10Data: nil` today (latent), so that field is unused in practice, with
-/// room for params if they migrate here too.
+/// room for params if they migrate here too. `baseLayerNAL` is the same RPU with its mapping kept: the
+/// frame carries it instead of `dmNAL` when it goes out as its raw base layer (released without its
+/// enhancement layer, or a composition that left the base layer intact), because nothing reshaped the
+/// picture and the display side has to.
 private struct FrameSideData: Sendable {
     let hdr10Data: Data?
     let dmNAL: [UInt8]?
+    let baseLayerNAL: [UInt8]?
 }
 
 /// What `DualLayerVideoDecoder` needs from its composer.
@@ -46,6 +50,11 @@ protocol FelComposing: Sendable {
         completion: @escaping @Sendable (CVPixelBuffer?) -> Void
     )
     func acquireSlot()
+    /// Waits for a slot until `timeout`: true holding it, false on timeout with nothing taken. The
+    /// decoder's compose queue waits with this, in slices, so a GPU that stopped completing is told
+    /// apart from a slow one (`composeStallSlices`). No default: a conformer that blocked here would
+    /// silently turn the stall handling off.
+    func acquireSlot(timeout: DispatchTime) -> Bool
     func releaseSlot()
     func flush()
     func releaseOutputPool()
@@ -53,9 +62,33 @@ protocol FelComposing: Sendable {
     func takePeakSlotsInUse() -> Int
     var allocatedPoolBuffers: Int { get }
     var meanGPUTimeMs: Double? { get }
+    /// Whether this frame's base-layer buffer can be the compose target (written in place).
+    func canComposeInPlace(baseBuffer: CVPixelBuffer, params: DoviMetalParams) -> Bool
+    /// Composes into the base-layer buffer itself; same slot rules as `composeAsyncWithAcquiredSlot`.
+    func composeInPlaceAsyncWithAcquiredSlot(
+        baseBuffer: CVPixelBuffer,
+        enhancementBuffer: CVPixelBuffer,
+        params: DoviMetalParams,
+        frameIndex: UInt32,
+        completion: @escaping @Sendable (DoviFelComposer.InPlaceResult) -> Void
+    )
+    /// Frames composed in place so far, for the 1 Hz summary.
+    var inPlaceComposedFrames: Int { get }
 }
 
 extension FelComposing {
+    func canComposeInPlace(baseBuffer: CVPixelBuffer, params: DoviMetalParams) -> Bool { false }
+    func composeInPlaceAsyncWithAcquiredSlot(
+        baseBuffer: CVPixelBuffer,
+        enhancementBuffer: CVPixelBuffer,
+        params: DoviMetalParams,
+        frameIndex: UInt32,
+        completion: @escaping @Sendable (DoviFelComposer.InPlaceResult) -> Void
+    ) {
+        releaseSlot()
+        completion(.baseIntact)
+    }
+    var inPlaceComposedFrames: Int { 0 }
     func releaseOutputPool() {}
     func flushTextureCache() {}
     func takePeakSlotsInUse() -> Int { 0 }
@@ -173,6 +206,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     private var _skipUntilPTS: CMTime?
 
+    /// The base layer's count: the enhancement layer decodes the same pictures.
+    var framesDecoded: UInt64 { primaryDecoder.framesDecoded }
+
     /// AE#739: called when the system invalidates either layer's session. Both sub-decoders report
     /// through `reportSessionLost()` (installed outside `lock`, as `skipUntilPTS` is), the enhancement
     /// decoder from when it opens.
@@ -243,10 +279,14 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Production use: builds the Metal composer (nil when there is no Metal
     /// device, in which case every frame bypasses). Tests inject a fake to
     /// control the GPU-slot wait without a GPU.
-    init(composer: (any FelComposing)? = DoviFelComposer()) {
+    init(composer: (any FelComposing)? = DoviFelComposer(),
+         composeStallTimeout: TimeInterval = DualLayerVideoDecoder.defaultComposeStallTimeout) {
+        precondition(composeStallTimeout > 0 && composeStallTimeout.isFinite, "composeStallTimeout must be a positive, finite number of seconds")
+        self.composeStallTimeout = composeStallTimeout
         self.composer = composer
         let primary = HardwareVideoDecoder()
         primary.useCustomBlockSource = true
+        primary.allowsInPlaceOutputMetadata = true
         self.primaryDecoder = primary
     }
 
@@ -255,11 +295,15 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     init(
         composer: (any FelComposing)?,
         primaryDecoder: any SingleLayerVideoDecoder,
-        enhancementDecoder: (any SingleLayerVideoDecoder)?
+        enhancementDecoder: (any SingleLayerVideoDecoder)?,
+        composeStallTimeout: TimeInterval = DualLayerVideoDecoder.defaultComposeStallTimeout
     ) {
+        precondition(composeStallTimeout > 0 && composeStallTimeout.isFinite, "composeStallTimeout must be a positive, finite number of seconds")
+        self.composeStallTimeout = composeStallTimeout
         self.composer = composer
         self.primaryDecoder = primaryDecoder
         (self.primaryDecoder as? HardwareVideoDecoder)?.useCustomBlockSource = true
+        (self.primaryDecoder as? HardwareVideoDecoder)?.allowsInPlaceOutputMetadata = true
         self.enhancementDecoder = enhancementDecoder
         (self.enhancementDecoder as? HardwareVideoDecoder)?.useCustomBlockSource = true
     }
@@ -276,6 +320,12 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     // `skipUntilPTS` fan-out, `open`) always run without the lock held — see the
     // ordering note on `skipUntilPTS`.
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
+    /// The stream's average frame rate in frames per second, from the container; nil when it declares none.
+    /// Only the compose check in the 1 Hz summary reads it. Guarded by `lock`.
+    private var streamFrameRate: Double?
+    /// Set once the summary has said compositions cannot keep up with the stream's frame rate, so the
+    /// line is logged once per session rather than once a second. Guarded by `lock`.
+    private var composeCannotKeepUpWarned = false
     // Stream classification (dolby-vision-fel.md §5.2, invariant I9 in §5.12): decided once, from the
     // first RPU's `el_type`, before the enhancement decoder opens. A per-frame
     // `disable_residual_flag` is a kernel flag (`DoviComposerFlags.disableResidual`,
@@ -291,8 +341,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// one log line per keyframe; the failure is reported once, and `decode` refuses packets after it.
     /// Guarded by `lock`.
     private var primaryOpenFailure: Error?
-    /// Fired once, on the thread that called `decode`, when the primary decoder cannot be opened from
-    /// in-band parameter sets: nothing can be shown, so the host should fall back or surface an error
+    /// Fired once when the primary decoder cannot be opened from in-band parameter sets (on the thread
+    /// that called `decode`) or when the compose stall bound is exhausted (on the compose queue; the host
+    /// hops to the main actor): nothing can be shown, so the host should fall back or surface an error
     /// (the hvcC path throws the equivalent from `open(stream:)`).
     var onFatalDecodeError: (@Sendable (Error) -> Void)? {
         get { lock.lock(); defer { lock.unlock() }; return _onFatalDecodeError }
@@ -328,17 +379,95 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Restamps each enhancement-layer packet with the time of the base-layer picture of the same POC,
     /// so pairing by time pairs by picture order even when the layers' GOPs differ. Guarded by `lock`.
     private var pictureAlignment = DualLayerVideoDecoder.makeAlignment()
-    private var blFrameQueue: [Int64: (buffer: CVPixelBuffer, pts: CMTime, ticket: UInt64, seq: UInt64, side: FrameSideData)] = [:]
+    /// `deadline` is the earliest presentation time (source seconds) among this frame and every base
+    /// frame that took a later ticket: delivery is ordered by ticket, so none of those can leave before
+    /// this one does. `arrivedAt` is the uptime at which it was queued.
+    private var blFrameQueue: [Int64: (buffer: CVPixelBuffer, pts: CMTime, ticket: UInt64, seq: UInt64, side: FrameSideData, deadline: Double, arrivedAt: TimeInterval)] = [:]
     private var elFrameQueue: [Int64: CVPixelBuffer] = [:]
 
     /// Maximum layer skew in frames (dolby-vision-fel.md §5.5): a waiting base-layer
     /// frame is bypassed under its own arrival ticket once this many newer
     /// base-layer frames have arrived. Starts at 3; the 1 Hz summary's maximum skew
-    /// counter (§5.11) is what measures whether it can tighten.
+    /// counter (§5.11) is what measures whether it can tighten. This is the rule only
+    /// when the host gave no render clock; with one the frame's presentation deadline
+    /// decides (`collectDueBypasses`).
     static let maxLayerSkewFrames = 3
+
+    /// What the host's render clock reads: its position in source seconds, whether it is advancing, and
+    /// whether it is held only because a start (after a seek or at the beginning) is waiting for the
+    /// renderer to fill. A clock held for any other reason is a pause.
+    struct RenderClockSample: Sendable {
+        var seconds: Double
+        var running: Bool
+        var prerolling: Bool = false
+        /// Playback rate, for how soon a deadline can come due; 1 when the host does not say.
+        var rate: Double = 1
+    }
+
+    /// The render clock, when the host has one. Set once by the host before the first packet; with none
+    /// (offline probes, tests) a waiting base frame is released by the count of newer arrivals alone.
+    /// Guarded by `lock`.
+    private var renderClock: (@Sendable () -> RenderClockSample?)?
+    /// Seconds per frame of the stream, for the deadline margin. 24 fps until the host says otherwise,
+    /// the same fallback the renderer's look-ahead gate uses. Guarded by `lock`.
+    private var deadlineFrameInterval: Double = 1.0 / 24
+
+    /// Installs the render clock and the stream's frame interval. Called by the host at load.
+    func setRenderClock(_ clock: (@Sendable () -> RenderClockSample?)?, frameRate: Double?) {
+        lock.lock()
+        renderClock = clock
+        if let frameRate, frameRate.isFinite, frameRate > 0 { deadlineFrameInterval = 1 / frameRate }
+        lock.unlock()
+    }
+
+    /// Uptime source for the wait on a held clock; tests replace it.
+    var uptimeProvider: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+
+    /// How many frame intervals before its presentation time a waiting base frame is given up on and
+    /// sent out as its base layer. It is the composer's pipeline depth (`DoviFelComposer.maxFramesInFlight`):
+    /// a frame released this far ahead of its time has room for every composition queued ahead of it,
+    /// so the release costs no lateness.
+    static let deadlineMarginFrames = DoviFelComposer.maxFramesInFlight
+    /// The margin never drops below this many seconds, so a high frame rate (where two intervals are
+    /// 33 ms at 60 fps) does not shrink the time a late enhancement layer has to arrive.
+    static let deadlineMarginFloor: Double = 0.1
+    /// The margin in seconds: `deadlineMarginFrames` frame intervals, or `deadlineMarginFloor`.
+    /// The same figure is the longest a base frame waits for a late enhancement layer while the clock
+    /// is held for a preroll, where there is no presentation time to count down to.
+    /// The caller holds `lock`.
+    private var deadlineMargin: Double {
+        max(Double(Self.deadlineMarginFrames) * deadlineFrameInterval, Self.deadlineMarginFloor)
+    }
+    /// A base frame is given at least this long, from its arrival, for its enhancement layer to follow
+    /// before the deadline rule may release it: one frame interval, but not under `enhancementGraceFloor`.
+    /// The two layers decode on separate sessions, so the partner of a frame that arrives already inside
+    /// its margin is normally a moment behind, not lost. Never more than `enhancementGraceCap`, so a low
+    /// frame rate does not hold a frame for long. A frame already past its presentation time is given
+    /// none (`graceFor`). The caller holds `lock`.
+    private var enhancementGrace: Double { min(max(deadlineFrameInterval, Self.enhancementGraceFloor), Self.enhancementGraceCap) }
+    static let enhancementGraceFloor: Double = 0.015
+    static let enhancementGraceCap: Double = 0.05
+    /// The grace a waiting frame is given with a running clock at `clockSeconds`: none once its
+    /// presentation time (`deadline`, the earliest of its own and those behind it) has been reached, since
+    /// a partner arriving after that is late whatever is done.
+    private func graceFor(deadline: Double, clockSeconds: Double) -> Double {
+        deadline <= clockSeconds ? 0 : enhancementGrace
+    }
+    /// How long a frame waits when the clock is held and no start is pending (a pause, or before the
+    /// clock is armed): nothing is late there, so this only bounds a layer that is lost for good.
+    static let heldClockWallBound: Double = 2
+    /// Count backstop alongside the deadline rule. `OrderedDelivery` skips a ticket once more than
+    /// `maxFramesInFlight + maxLayerSkew + 2` frames are pending behind it (7 now), where the backstop
+    /// fires at `maxFramesInFlight + maxLayerSkewFrames + 1` newer arrivals (6): a margin of two, so
+    /// the frames queued behind a waiting one cannot reach the point where the stall guard skips its
+    /// ticket. Bounds the queue as well.
+    static let maxDeadlineHoldFrames = DoviFelComposer.maxFramesInFlight + maxLayerSkewFrames + 1
 
     /// A waiting base frame is bypassed once K newer ones have arrived, so an enhancement picture
     /// restamped K or more frames back would find its partner gone: the alignment declines to place those.
+    /// This is the count rule's K (`maxLayerSkewFrames`), still the figure with no render clock. With one
+    /// a frame waits up to `maxDeadlineHoldFrames` arrivals, longer than K, so the alignment's bound is
+    /// conservative there: it declines placements the deadline rule could have absorbed.
     static func makeAlignment() -> DualLayerPictureAlignment {
         var a = DualLayerPictureAlignment()
         a.maxBackwardRestamp = maxLayerSkewFrames - 1
@@ -355,12 +484,22 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// arrival (dolby-vision-fel.md §5.5). Not "older than the newest": output is in decode
     /// order, so older-PTS base frames settle after newer ones. Guarded by `lock`.
     private var settledBlKeys: [Int64] = []
+    /// Keys of access units that carried no enhancement-layer NAL, noted in `decode(packet:)` before the
+    /// base layer is fed, so the base frame bypasses on arrival instead of waiting for a partner that
+    /// cannot come. Bounded like `settledBlKeys`. Guarded by `lock`.
+    private var elAbsentKeys: [Int64] = []
+    /// Next sweep: `deadlineSweepScheduled` while one is armed, `sweepGeneration` to retire an older timer
+    /// when an earlier one replaces it, `sweepFireUptime` for when the armed one fires. Guarded by `lock`.
+    private var deadlineSweepScheduled = false
+    private var sweepGeneration: UInt64 = 0
+    private var sweepFireUptime: TimeInterval = .infinity
     /// How many settled base-layer keys are remembered (dolby-vision-fel.md §5.5).
     static let settledKeyMemory = 64
     /// Last parameters that came from a real RPU, and how many frames in a row have borrowed them. Both
     /// move in decode order, in `recordSideData`.
     private var lastGoodParams: DoviMetalParams?
     private var lastGoodDMNAL: [UInt8]?
+    private var lastGoodBaseLayerNAL: [UInt8]?
     private var borrowedParamsRun = 0
     /// A frame whose RPU is missing or failed its CRC may borrow the previous frame's parameters
     /// for up to this many frames in a row. Reshaping and NLQ parameters are constant across a scene,
@@ -378,17 +517,56 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Guarded by `composeResultLock`.
     private var totalComposedFrames: Int = 0
     private var summaryComposeFailures: Int = 0
+    /// Frames dropped because an in-place composition failed after the GPU had started writing into the
+    /// base-layer buffer. Guarded by `composeResultLock`.
+    private var summaryInPlaceDropped: Int = 0
+    /// Frames sent out as the base layer, with its mapping-preserving RPU, because the compose queue was
+    /// in stall mode (`acquireSlotOrStall`). Guarded by `composeResultLock`; reset by the 1 Hz summary.
+    private var summaryBypassComposeStalled: Int = 0
+    /// Times the compose queue entered stall mode since this decoder was created; never reset, so a probe
+    /// or test can ask "did the GPU stall". Guarded by `composeResultLock`.
+    private var totalComposeStalls: Int = 0
+    /// The longest a bypass waited on `composeQueue` behind compositions, in the summary interval, in
+    /// milliseconds (`fulfilBypass`): shows on a device whether the queue's head-of-line wait matters.
+    /// Guarded by `composeResultLock`; reset by the 1 Hz summary.
+    private var summaryBypassQueueWaitMaxMs: Double = 0
     /// Compositions started, and compositions whose frame (composed or fallback) has been handed to
-    /// `orderedDelivery`. Equal when nothing is on the GPU or in a completion handler. Guarded by
-    /// `composeResultLock`; read by `drainForEndOfStream` and `quiesceForTesting`.
+    /// `orderedDelivery`. Equal when nothing is on the GPU, in a completion handler or on `composeQueue`
+    /// (bypassed frames queued there count too, `fulfilBypass`). Guarded by `composeResultLock`; read by
+    /// `drainForEndOfStream` and `quiesceForTesting`.
     private var composeRequestsStarted = 0
     private var composeRequestsHandedOff = 0
-    private var summaryBypassNoEL: Int = 0
+    /// Base frames sent out without a partner, by the rule that released them. Guarded by `lock`.
+    /// The access unit carried no enhancement layer; its presentation deadline less the margin came
+    /// while the clock ran; the wait bound passed while the clock was held; the count of newer
+    /// arrivals was reached (the stall-guard backstop, or the count rule when there is no clock);
+    /// the enhancement session was missing; the stream ended with the frame still waiting.
+    private var summaryBypassNoELInAU: Int = 0
+    private var summaryBypassDeadline: Int = 0
+    private var summaryBypassHeldWall: Int = 0
+    private var summaryBypassBackstop: Int = 0
+    private var summaryBypassNoELDecoder: Int = 0
+    private var summaryBypassEndOfStream: Int = 0
     private var summaryBypassNoRPU: Int = 0
+    /// Frames whose mapping-preserving RPU could not be made, so a bypass would carry the composed
+    /// (mapping-stripped) one. The first per decoder also logs at info level. Guarded by `lock`.
+    private var summaryMappingFallback: Int = 0
+    private var loggedMappingFallback = false
     private var summaryDropStaleEL: Int = 0
     private var summaryPrunedEL: Int = 0
     private var summaryMaxObservedSkew: Int = 0
     private var lastSummaryTimestamp: TimeInterval = 0
+    /// Session totals behind the info-level counter line (`totalsLine`). Unlike the per-second
+    /// `summary*` counters they survive `flush()`, so a seek does not restart them; `close()` resets
+    /// them. Guarded by `lock`.
+    private var totalComposed: Int = 0
+    private var totalBypassDeadline: Int = 0
+    private var totalBypassHeldWall: Int = 0
+    private var totalBypassBackstop: Int = 0
+    /// When the totals line last went out, and what it said (the sum of the totals), so the
+    /// next one is rate limited and only goes out when a count moved. Guarded by `lock`.
+    private var lastTotalsLogTimestamp: TimeInterval?
+    private var lastLoggedTotalsSum: Int = 0
 
     /// Held for the whole of `flush()` and `close()`, so two of them (the EOF flush on the demux
     /// thread against a seek flush on the main actor, or either against `close()`) run one after
@@ -400,6 +578,76 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// it held; `decode(packet:)` does not take it either.
     private let lifecycleLock = NSLock()
     private let lock = NSRecursiveLock()
+    /// Where a paired frame waits for its GPU slot and is encoded and committed (`composeOnQueue`), so
+    /// the VideoToolbox callback that paired it only records, pairs and enqueues (`runCompose`). Serial:
+    /// the slot semaphore serialises the waits anyway, and one queue keeps the slots taken in hand-off
+    /// order. Ordering is still `orderedDelivery`'s, by ticket. `.userInteractive` like the delivery
+    /// queues around it; the hop costs one dispatch per composed frame.
+    ///
+    /// Lock order with the queue: `lifecycleLock` before `lock` before `composeResultLock`, as above.
+    /// Work on this queue takes `lock` (`isRetired`), `composeBacklog` and `composeResultLock` on their
+    /// own, one at a time, and waits on the composer's slot semaphore holding none of them; the slot is
+    /// released by Metal's completion handler, which takes none of them. Nothing waits on this queue (no
+    /// `sync`, no barrier), so no lock holder can be waiting behind it. `composeBacklog` is a leaf:
+    /// nothing else is taken while it is held, and nothing is logged, fulfilled or reported under it
+    /// (`flush()` and `close()` take it under `lock`, the one nesting there is).
+    private let composeQueue = DispatchQueue(label: "de.superuser404.dovi.compose", qos: .userInteractive)
+    /// Compositions handed to `composeQueue` that have not yet got their GPU slot (or been dropped as
+    /// retired). Guarded by `composeBacklog`, which `decode(packet:)` waits on (`waitForComposeBacklog`).
+    private let composeBacklog = NSCondition()
+    private var composesAwaitingSlot = 0
+    /// A mirror of `_feedEpoch`, written only by `resetComposeBacklog(epoch:)` from inside the `lock`
+    /// section of `flush()` / `close()` that bumps `_feedEpoch`; equal to it outside that section. The
+    /// feed's wait and the verdict compare against this, under `composeBacklog`, so an epoch change is
+    /// never missed between a check and a wait. Guarded by `composeBacklog`.
+    private var composeBacklogEpoch: UInt64 = 0
+    /// Stall mode: the queue head waited `composeStallSlices` slices in a row for a GPU slot, so the GPU
+    /// is taken to have stopped completing. While it lasts each queued composition takes a slot only if
+    /// one is free right now, and otherwise goes out as the base layer with its mapping-preserving RPU.
+    /// Ends when a slot is got again (progress) or on `flush()` / `close()`. Bounded: a stall that keeps
+    /// coming back or never ends is reported once as `VideoDecoderError.composerStalled`
+    /// (`reportComposerStalled`), see `maxComposeStallBypassFrames` and `maxComposeStallEpisodes`.
+    /// Guarded by `composeBacklog`.
+    private var composeStalled = false
+    /// Stall verdicts since the last healthy stretch. Not reset by `flush()`: a GPU that stops again
+    /// after every seek is the same dead GPU. Guarded by `composeBacklog`.
+    private var composeStallEpisodes = 0
+    /// Compositions that got a slot since the last stall verdict, counted up to
+    /// `composeHealthyFramesToResetStalls`. Guarded by `composeBacklog`.
+    private var composeHealthyRun = 0
+    /// Set when the bound was hit and the error handed to the host; reported once. Guarded by `composeBacklog`.
+    private var composeStallEscalated = false
+    /// Base-layer frames sent out in the current stall mode, for the resume log. Guarded by `composeBacklog`.
+    private var composeStallBypassRun = 0
+    /// The backlog past which `decode(packet:)` holds the feed back. The parked callback threads used to
+    /// be that backpressure; without it a stalled GPU would let VideoToolbox's buffers pile up on the
+    /// queue for as long as the host kept feeding. One queued frame per slot in flight. The feed waits
+    /// for room with no timeout of its own, so the backlog (and the base and enhancement buffers each
+    /// queued composition holds) is bounded by this whatever the GPU does: room appears when the head
+    /// gets a slot, is retired (within a slice of a flush or close), or reaches the stall verdict.
+    static let maxComposesAwaitingSlot = DoviFelComposer.maxFramesInFlight
+    /// How many slice waits in a row, each timing out, make the stall verdict.
+    static let composeStallSlices = 4
+    /// The bound on one stall mode: this many frames sent out as the base layer without a single slot
+    /// coming free (about 25 s of video at 24 fps) and the GPU is taken to be gone for good. Counted in
+    /// frames, never in clock time, like the verdict itself.
+    static let maxComposeStallBypassFrames = 600
+    /// The bound on a GPU that recovers and stalls again: the verdict is allowed this many times without
+    /// a healthy stretch (`composeHealthyFramesToResetStalls`) between; the next one is reported.
+    static let maxComposeStallEpisodes = 3
+    /// Compositions that must get a slot after a stall verdict (about 10 s of video at 24 fps) before the
+    /// episode count starts again from zero.
+    static let composeHealthyFramesToResetStalls = 240
+    /// The default `composeStallTimeout`: how long the queue head must have waited, in running time and
+    /// with no slot freed, before the GPU is taken to have stopped completing. Metal's own watchdog fails
+    /// a command buffer that runs away long before this, and a failed one still returns its slot, so only
+    /// work that never completes at all reaches it.
+    static let defaultComposeStallTimeout: TimeInterval = 2
+    /// The wait for a slot is cut into `composeStallSlices` slices of this length. The verdict counts
+    /// timed-out slices, never compares clock readings, so a process suspension of any length ends at
+    /// most one slice (see `acquireSlotOrStall`). Injected for tests.
+    let composeStallTimeout: TimeInterval
+    private var composeStallSlice: TimeInterval { composeStallTimeout / Double(Self.composeStallSlices) }
     private var _feedEpoch: UInt64 = 0
     /// True while `flush()` is draining the hardware decoders (dolby-vision-fel.md
     /// §5.8). `HardwareVideoDecoder.flush()` waits for the frames VideoToolbox
@@ -443,6 +691,87 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         return canonicalKey(pts: pts)
     }
 
+    // MARK: - External base layer (AVPlayer output route)
+
+    /// The time base the external base-layer route stamps its packets in; nil on the software host,
+    /// where the base layer is decoded here. Guarded by `lock`.
+    private var externalBaseLayerTimeBase: AVRational?
+    /// Whether the external-base-layer route composes into the buffers the host handed in. Off by default:
+    /// those buffers belong to the host's player, and no API contract says they may be written. Guarded by
+    /// `lock`.
+    private var externalBaseLayerComposesInPlace = false
+
+    /// The software host always composes into its own decoder's buffers. The external-base-layer route does
+    /// only when it was opened with `composeInPlace`, since its buffers are the host player's. The caller
+    /// holds `lock`: it travels in the `ComposeRequest`, so nothing takes `lock` between pairing a frame and
+    /// its `fulfil`. A wait there is time for the frames behind it to reach `OrderedDelivery`'s stall guard,
+    /// which then gives up the ticket that is still on its way.
+    private var composesIntoBaseBuffers: Bool {
+        externalBaseLayerTimeBase == nil || externalBaseLayerComposesInPlace
+    }
+
+    /// True when the base layer is not decoded by this decoder: the host decodes it elsewhere (AVPlayer,
+    /// on the output route) and hands each decoded frame to `submitBaseLayerFrame`. Everything else is
+    /// unchanged: `decode(packet:)` still splits the enhancement layer and the RPU off the full source
+    /// packet, the enhancement layer still decodes here, and pairing, composition and ordered delivery are
+    /// the code the software host runs. Opened with `openExternalBaseLayer`. The packets are then
+    /// stamped by the host in `timeBase` (the served presentation time), the same axis the submitted
+    /// frames carry.
+    ///
+    /// `composeInPlace` writes the composition into the host's buffers instead of the output pool. It saves
+    /// the pool (129 to 195 MB measured for 4K) and is only safe when nothing else reads those buffers again, which
+    /// the host's player does not promise, so it is an opt-in for measurement and never the default.
+    func openExternalBaseLayer(
+        codecpar: UnsafePointer<AVCodecParameters>, timeBase: AVRational, frameRate: Double?,
+        composeInPlace: Bool = false,
+        onFrame: @escaping DecodedFrameHandler
+    ) throws {
+        lock.lock()
+        let closed = isClosed
+        let hasComposer = composer != nil
+        lock.unlock()
+        guard !closed else { throw VideoDecoderError.decoderClosed }
+        guard hasComposer else {
+            EngineLog.emit("[DualLayerVideoDecoder] No composer available; FEL composition disabled", category: .swPlayback)
+            throw VideoDecoderError.composerUnavailable
+        }
+        lock.lock()
+        declaredFormat = (ColorDescription(codecpar: codecpar), codecpar.pointee.codec_id, codecpar.pointee.profile)
+        lock.unlock()
+        self.onFrame = { [weak self] buffer, pts, extra in
+            self?.reportDecodedFormat(buffer)
+            onFrame(buffer, pts, extra)
+        }
+        lock.lock()
+        self.timeBase = timeBase
+        streamFrameRate = frameRate
+        if let frameRate, frameRate.isFinite, frameRate > 0 { deadlineFrameInterval = 1 / frameRate }
+        if codecpar.pointee.extradata_size > 23, let ed = codecpar.pointee.extradata, ed[0] == 1 {
+            pictureAlignment.seedBaseParameterSets(parseHVCCParameterSets(ed, Int(codecpar.pointee.extradata_size)))
+        }
+        externalBaseLayerTimeBase = timeBase
+        externalBaseLayerComposesInPlace = composeInPlace
+        // No primary session to open or to wait for: the host hands the decoded frames in.
+        primaryDecoderInitialized = true
+        lock.unlock()
+    }
+
+    /// One decoded base-layer frame from the host, in place of the primary decoder's output. The same
+    /// entry the primary decoder's callback uses.
+    ///
+    /// `epoch` is the `feedEpoch` the host read before it took the frame from its player. A flush in
+    /// between bumps the epoch, and a frame stamped with an older one belongs to the position the flush
+    /// left and is dropped here, so it cannot pair against the new position's enhancement layer.
+    func submitBaseLayerFrame(_ buffer: CVPixelBuffer, pts: CMTime, hdr10Data: Data? = nil, epoch: UInt64? = nil) {
+        if let epoch {
+            lock.lock()
+            let stale = epoch != _feedEpoch
+            lock.unlock()
+            if stale { return }
+        }
+        handleBaseLayerFrame(baseBuffer: buffer, pts: pts, hdr10Data: hdr10Data)
+    }
+
     // MARK: - Lifecycle
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
@@ -470,6 +799,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         lock.lock()
         self.timeBase = stream.pointee.time_base
+        let avgRate = stream.pointee.avg_frame_rate
+        streamFrameRate = avgRate.num > 0 && avgRate.den > 0 ? Double(avgRate.num) / Double(avgRate.den) : nil
         // Only an hvcC record can build the session up front. Extradata of that size that is something
         // else (an Annex B parameter-set blob, say) takes the in-band path, where the parameter
         // sets are read from the packets, instead of throwing out of `open`.
@@ -515,12 +846,24 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             lock.unlock()
             return
         }
+        // A reported failure (the primary decoder would not open, or the GPU stalled for good) is final:
+        // the host has been told, and more packets would only refill a backlog nothing drains.
+        if primaryOpenFailure != nil {
+            lock.unlock()
+            return
+        }
         // The epoch this packet entered under, whether or not the caller passed one: a `flush()` that
         // lands while the packet is being parsed below must stop it from touching post-flush state.
         let entryEpoch = _feedEpoch
         let primed = primaryDecoderInitialized
         let tb = timeBase
         lock.unlock()
+
+        // No lock held: the backpressure a stalled GPU used to put on the VideoToolbox callback threads
+        // lands on the feed instead. It waits for room in the compose backlog or for the epoch to move; a
+        // stalled GPU does not refuse the packet (stall mode drains the backlog on its own). False means a
+        // `flush()` or `close()` landed after this packet passed the gate above: it belongs to the old feed.
+        guard waitForComposeBacklog(entryEpoch: entryEpoch) else { return }
 
         if !primed {
             ensurePrimaryDecoder(from: packet)
@@ -570,7 +913,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if ptsKey != Int64.min {
             // In decode order, here, so every frame carries concrete parameters by the time it pairs:
             // compose time runs in completion order, which is not stream order.
-            recordSideData(key: ptsKey, params: layers.rpuParams, dmNAL: layers.convertedRpu,
+            DoviDmPassthroughProbe.shared.noteSource(key: ptsKey, rpu: layers.rpuData)
+            recordSideData(key: ptsKey, params: layers.rpuParams, dmNAL: layers.convertedRpu, baseLayerNAL: layers.baseLayerRpu,
                            usesPrevious: layers.usesPreviousMapping, disableResidual: layers.disableResidual)
         }
 
@@ -585,6 +929,20 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             let wasReordered = pictureAlignment.reorderedUnits > 0
             let elPTS = pictureAlignment.enhancementPTS(data, Int(packet.pointee.size), framing: .lengthPrefixed(size: 4), pts: ptsRaw)
             let nowReordered = pictureAlignment.reorderedUnits > 0
+            // An access unit with no enhancement-layer NAL has no enhancement picture to wait for, but
+            // only where the layers' pictures sit in the same units: once any is restamped, a unit's
+            // enhancement picture belongs to another frame's time, so a unit without one says nothing
+            // about its own base frame. Judged after this unit's restamp, so it counts too.
+            // Known gap: a reordered stream is recognised only once its first restamp has happened, so
+            // the units before it (the start of each open, and again after a seek, since `flush()`
+            // resets the alignment) can still note an absence for a base frame whose enhancement picture
+            // is in another unit; such a frame is released early and shows as its base layer. The window
+            // is bounded to that start-up stretch, and the notes are cleared the moment reordering is seen.
+            if nowReordered {
+                elAbsentKeys.removeAll()
+            } else if ptsKey != Int64.min, layers.elPacket == nil {
+                noteEnhancementAbsent(key: ptsKey)
+            }
             lock.unlock()
             layers.elPacket?.pointee.pts = elPTS
             if nowReordered && !wasReordered {
@@ -631,8 +989,10 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // that landed after the entry gate must not reopen/feed a torn-down session.
         lock.lock()
         let closedBeforePrimary = isClosed
+        let hostDecodesBaseLayer = externalBaseLayerTimeBase != nil
         lock.unlock()
         guard !closedBeforePrimary else { return }
+        if hostDecodesBaseLayer { return }
         primaryDecoder.decode(packet: packet, epoch: epoch)
     }
 
@@ -827,6 +1187,21 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         return t
     }
 
+    /// The index the compose kernels dither on (they alternate the pattern on its parity). The software host
+    /// counts compositions. With the base layer delivered by the host the count would depend on which
+    /// frames reached the composer and when, so the pattern would differ between two runs of the same
+    /// clip; the frame's position in the stream (presentation time times frame rate) does not. The caller
+    /// holds `lock`.
+    private func nextComposeFrameIndex(pts: CMTime) -> UInt32 {
+        if externalBaseLayerTimeBase != nil,
+           let rate = streamFrameRate, rate > 0, pts.isNumeric {
+            frameIndex = UInt32(truncatingIfNeeded: Int64((pts.seconds * rate).rounded()))
+        } else {
+            frameIndex &+= 1
+        }
+        return frameIndex
+    }
+
     /// Looks up and removes this frame's Profile 8.1 display-metadata NAL,
     /// within the same jitter tolerance as the RPU cache. The caller holds
     /// `lock`.
@@ -836,8 +1211,20 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// frame instead of living in a cache `OrderedDelivery.emit` would
     /// otherwise have to reach back into without the decoder's lock
     /// (dolby-vision-fel.md §5.7).
-    private func resolveDisplayMetadata(key: Int64) -> [UInt8]? {
-        sideDataRing.removeDisplayMetadata(key: key)
+    ///
+    /// Both forms come back, because whether the frame is composed is not decided yet: `composed` has no
+    /// mapping, `baseLayer` keeps it. A frame whose mapping-preserved form could not be made falls back to
+    /// the composed one, as it carried before.
+    private func resolveDisplayMetadata(key: Int64) -> (composed: [UInt8]?, baseLayer: [UInt8]?) {
+        let forms = sideDataRing.removeDisplayMetadataForms(key: key)
+        if forms.baseLayer == nil, forms.composed != nil {
+            summaryMappingFallback += 1
+            if !loggedMappingFallback {
+                loggedMappingFallback = true
+                EngineLog.emit("[DualLayerVideoDecoder] no mapping-preserving RPU for key=\(key); a bypassed frame carries the composed one", category: .swPlayback, level: .info)
+            }
+        }
+        return (forms.composed, forms.baseLayer ?? forms.composed)
     }
 
     // MARK: - Frame Pairing & Metal Composition
@@ -856,7 +1243,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// `ticket` (dolby-vision-fel.md §5.7): `dmNAL` so `OrderedDelivery.emit` never
     /// touches `dmRpuCache`, `epoch` so a late completion can tell a stale
     /// delivery from a current one without the decoder lock.
-    private struct ComposeRequest {
+    private struct ComposeRequest: @unchecked Sendable {
         let ticket: UInt64
         let epoch: UInt64
         let base: CVPixelBuffer
@@ -865,9 +1252,14 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let frameIndex: UInt32
         let pts: CMTime
         let hdr10Data: Data?
+        /// The composed frame's RPU (no mapping).
         let dmNAL: [UInt8]?
+        /// The RPU with its mapping kept, for the base layer delivered in place of a composition that failed.
+        let baseLayerNAL: [UInt8]?
         /// Which arrival path produced this, for the compose-failure log.
         let arrived: String
+        /// `composesIntoBaseBuffers`, read under `lock` when the frame was paired.
+        let composesIntoBase: Bool
     }
 
     private struct BypassRequest {
@@ -876,6 +1268,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let buffer: CVPixelBuffer
         let pts: CMTime
         let hdr10Data: Data?
+        /// The raw base layer's RPU: the mapping kept, so the display side reshapes it.
         let dmNAL: [UInt8]?
         let reason: String
     }
@@ -886,35 +1279,285 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         case compose(ComposeRequest)
     }
 
-    /// Hands one bypass request straight to `orderedDelivery`. No lock held.
+    /// Hands one bypass request to `orderedDelivery` through `composeQueue`, behind every composition
+    /// handed off before it. No lock held. Sent straight to `fulfil`, bypasses overtook compositions
+    /// still queued for a GPU slot, and once more than `OrderedDelivery`'s stall threshold of later
+    /// frames had arrived ahead of one, its ticket was skipped as lost and the frame dropped. Through the
+    /// queue, a bypass can only overtake the compositions already on the GPU, as when the callback thread
+    /// parked in the slot wait. Counted like a composition, so `drainForEndOfStream` waits for it too.
     private func fulfilBypass(_ req: BypassRequest) {
-        orderedDelivery.fulfil(
-            ticket: req.ticket, epoch: req.epoch,
-            DeliveredFrame(buffer: SendableBuffer(value: req.buffer), pts: req.pts, hdr10Data: req.hdr10Data, dmNAL: req.dmNAL)
-        )
+        composeResultLock.lock(); composeRequestsStarted += 1; composeResultLock.unlock()
+        let delivery = orderedDelivery
+        let ticket = req.ticket
+        let epoch = req.epoch
+        let frame = DeliveredFrame(buffer: SendableBuffer(value: req.buffer), pts: req.pts, hdr10Data: req.hdr10Data, dmNAL: req.dmNAL)
+        let queuedAt = DispatchTime.now().uptimeNanoseconds
+        composeQueue.async { [self] in
+            let waitedMs = Double(DispatchTime.now().uptimeNanoseconds &- queuedAt) / 1_000_000
+            delivery.fulfil(ticket: ticket, epoch: epoch, frame)
+            composeResultLock.lock()
+            composeRequestsHandedOff += 1
+            if waitedMs > summaryBypassQueueWaitMaxMs { summaryBypassQueueWaitMaxMs = waitedMs }
+            composeResultLock.unlock()
+        }
     }
 
-    /// Acquires the GPU slot with no lock held, then encodes and commits. The
-    /// completed frame (or the base layer when composition fails) reaches
-    /// `orderedDelivery`, which reorders by ticket. The completion closure
-    /// captures `orderedDelivery` strongly and the decoder weakly for counters
-    /// (dolby-vision-fel.md §5.7): a completion that outlives the decoder
-    /// still calls `fulfil`, which drops it once `orderedDelivery`'s epoch has
-    /// moved on, instead of silently no-oping on a `weak self`.
+    /// Hands one composition to `composeQueue` and returns; no lock held. Runs on the VideoToolbox
+    /// output thread that paired the frame, which must not wait: VideoToolbox may make the callback on
+    /// the thread that submitted the frame, with `HardwareVideoDecoder.lock` held, and a callback that
+    /// blocks stalls that session's whole output. The GPU slot wait (`maxFramesInFlight`) and the output
+    /// pool's retry sleeps used to land here and back up decode of both layers on a GPU or pool hiccup;
+    /// they now land on `composeQueue` (`composeOnQueue`).
+    ///
+    /// Counted as started here, not on the queue, so `drainForEndOfStream` and `quiesceForTesting`
+    /// wait for a composition that is still queued as well as one on the GPU. The request keeps both
+    /// pixel buffers alive while it waits, as the parked callback thread did, and `decode(packet:)`
+    /// holds the feed back while too many are waiting (`waitForComposeBacklog`).
     private func runCompose(_ req: ComposeRequest) {
         guard let composer else {
             orderedDelivery.fulfil(
                 ticket: req.ticket, epoch: req.epoch,
-                DeliveredFrame(buffer: SendableBuffer(value: req.base), pts: req.pts, hdr10Data: req.hdr10Data, dmNAL: req.dmNAL)
+                DeliveredFrame(buffer: SendableBuffer(value: req.base), pts: req.pts, hdr10Data: req.hdr10Data, dmNAL: req.baseLayerNAL)
             )
             return
         }
-        if let concrete = composer as? DoviFelComposer {
+        composeResultLock.lock(); composeRequestsStarted += 1; composeResultLock.unlock()
+        composeBacklog.lock()
+        composesAwaitingSlot += 1
+        composeBacklog.unlock()
+        // Strong `self`: the decoder outlives a composition it queued, as it did a callback parked in it.
+        composeQueue.async { [self] in
+            composeOnQueue(req, composer: composer)
+        }
+    }
+
+    /// True once `flush()` or `close()` has moved the epoch past the one `req` was issued in: its
+    /// ticket is retired and `orderedDelivery` would drop the frame, so it is not worth a GPU slot.
+    /// Takes `lock` for a moment, from `composeQueue`; nothing holds `lock` while waiting on that queue.
+    private func isRetired(_ req: ComposeRequest) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return req.epoch != _feedEpoch
+    }
+
+    /// Waits while `maxComposesAwaitingSlot` or more compositions are queued for a GPU slot, until one
+    /// gets its slot (or is dropped as retired or sent out in stall mode), or `flush()` / `close()` moves
+    /// the epoch past `entryEpoch`. Called by `decode(packet:)` with no lock held: the feeding thread
+    /// absorbs the backpressure, never a VideoToolbox callback. Has no clock of its own: the queue head's
+    /// stall verdict guarantees room within about `composeStallTimeout` of running time, so the wait
+    /// cannot outlast a GPU that stopped. Returns false when the epoch moved (the packet is pre-seek or
+    /// post-close and is refused), true otherwise. Internal for `DualLayerGpuSlotWaitTests`.
+    @discardableResult
+    func waitForComposeBacklog(entryEpoch: UInt64) -> Bool {
+        composeBacklog.lock()
+        while composesAwaitingSlot >= Self.maxComposesAwaitingSlot, composeBacklogEpoch == entryEpoch {
+            composeBacklog.wait()
+        }
+        let current = composeBacklogEpoch == entryEpoch
+        composeBacklog.unlock()
+        return current
+    }
+
+    private func leaveComposeBacklog() {
+        composeBacklog.lock()
+        composesAwaitingSlot -= 1
+        composeBacklog.broadcast()
+        composeBacklog.unlock()
+    }
+
+    /// Moves the backlog to `epoch`, clears stall mode and releases a feed waiting on the backlog, for
+    /// `flush()` and `close()`: a seek or teardown must not wait for the GPU. The caller holds `lock`
+    /// (lock order `lock` then `composeBacklog`); this takes only `composeBacklog`, a leaf. Returns whether
+    /// stall mode was on, so the caller can log the clear once it has released `lock`.
+    private func resetComposeBacklog(epoch: UInt64) -> Bool {
+        composeBacklog.lock()
+        composeBacklogEpoch = epoch
+        let wasStalled = composeStalled
+        composeStalled = false
+        composeStallBypassRun = 0
+        composeBacklog.broadcast()
+        composeBacklog.unlock()
+        return wasStalled
+    }
+
+    private func isInStallMode() -> Bool {
+        composeBacklog.lock(); defer { composeBacklog.unlock() }
+        return composeStalled
+    }
+
+    /// The verdict: starts stall mode if `epoch` is still the current one. False when a `flush()` or
+    /// `close()` got in between (the request is retired, and the new epoch must not start stalled).
+    /// Takes `composeBacklog`, then `composeResultLock` and the log on their own, never nested.
+    private func enterStallMode(epoch: UInt64) -> Bool {
+        composeBacklog.lock()
+        guard composeBacklogEpoch == epoch else {
+            composeBacklog.unlock()
+            return false
+        }
+        composeStalled = true
+        composeStallBypassRun = 0
+        composeStallEpisodes += 1
+        composeHealthyRun = 0
+        let episodes = composeStallEpisodes
+        composeBacklog.unlock()
+        composeResultLock.lock(); totalComposeStalls += 1; composeResultLock.unlock()
+        if episodes > Self.maxComposeStallEpisodes {
+            reportComposerStalled(reason: "\(episodes - 1) stalls without \(Self.composeHealthyFramesToResetStalls) healthy compositions between")
+        } else {
+            let ms = Int((composeStallTimeout * 1000).rounded())
+            EngineLog.emit("[DualLayerVideoDecoder] compose stalled: no GPU slot for \(Self.composeStallSlices) waits of \(ms / Self.composeStallSlices) ms; sending frames as the base layer until the GPU frees one",
+                           category: .swPlayback)
+        }
+        return true
+    }
+
+    /// Progress: a slot came free in stall mode. Clears the flag and logs the resume.
+    private func endStallModeOnProgress() {
+        composeBacklog.lock()
+        let wasStalled = composeStalled
+        let run = composeStallBypassRun
+        composeStalled = false
+        composeStallBypassRun = 0
+        composeBacklog.unlock()
+        if wasStalled {
+            EngineLog.emit("[DualLayerVideoDecoder] compose resumed after \(run) base-layer frames", category: .swPlayback)
+        }
+    }
+
+    /// One frame sent out as the base layer in stall mode.
+    private func noteStalledBypass() {
+        composeBacklog.lock()
+        composeStallBypassRun += 1
+        let run = composeStallBypassRun
+        composeBacklog.unlock()
+        composeResultLock.lock(); summaryBypassComposeStalled += 1; composeResultLock.unlock()
+        if run >= Self.maxComposeStallBypassFrames {
+            reportComposerStalled(reason: "\(run) frames sent as the base layer without a free GPU slot")
+        }
+    }
+
+    /// A composition got its slot outside stall mode: after `composeHealthyFramesToResetStalls` of them
+    /// the GPU is taken to have recovered and the episode count restarts.
+    private func noteComposeProgress() {
+        composeBacklog.lock()
+        if composeStallEpisodes > 0 {
+            composeHealthyRun += 1
+            if composeHealthyRun >= Self.composeHealthyFramesToResetStalls {
+                composeStallEpisodes = 0
+                composeHealthyRun = 0
+            }
+        }
+        composeBacklog.unlock()
+    }
+
+    /// Hands the bound's verdict to the host, once: the GPU stopped completing and stays that way, so the
+    /// base layer is no longer a degraded picture but a stalled one. Same path as a failed primary open:
+    /// `fatalDecodeError` holds it, `onFatalDecodeError` receives it, and `decode(packet:)` refuses
+    /// packets from then on. Called from the compose queue only, with no lock held (the handler is the
+    /// host's, and delivery to it never happens under `lock`, `composeBacklog` or `composeResultLock`).
+    private func reportComposerStalled(reason: String) {
+        composeBacklog.lock()
+        let first = !composeStallEscalated
+        composeStallEscalated = true
+        composeBacklog.unlock()
+        guard first else { return }
+        let error = VideoDecoderError.composerStalled
+        lock.lock()
+        if primaryOpenFailure == nil { primaryOpenFailure = error }
+        let handler = _onFatalDecodeError
+        lock.unlock()
+        EngineLog.emit("[DualLayerVideoDecoder] compose stalled for good (\(reason)); reporting a fatal decode error", category: .swPlayback)
+        handler?(error)
+    }
+
+    private enum SlotOutcome { case acquired, retired, stalled }
+
+    /// The queue head's wait for a GPU slot, with the stall verdict. Holds no lock across the wait.
+    ///
+    /// Normally the wait is `composeStallSlices` slices of `composeStallSlice`. A slice that times out
+    /// for a request that a flush or close has retired in the meantime ends the wait at once; after
+    /// `composeStallSlices` timed-out slices in a row the verdict is stall mode. No clock readings are
+    /// compared: a stopped thread cannot start a new wait, so a process suspension of any length ends at
+    /// most one slice, and the verdict needs about (slices - 1) / slices of `composeStallTimeout` of
+    /// running time with no slot freed. Load shrinks the same way: a starved thread loses whole slices.
+    ///
+    /// In stall mode each request only tries for a slot that is free right now; getting one ends stall mode.
+    private func acquireSlotOrStall(_ req: ComposeRequest, _ composer: any FelComposing) -> SlotOutcome {
+        if isInStallMode() {
+            guard composer.acquireSlot(timeout: .now()) else {
+                return isRetired(req) ? .retired : .stalled
+            }
+            endStallModeOnProgress()
+            return .acquired
+        }
+        var timedOut = 0
+        while true {
+            if composer.acquireSlot(timeout: .now() + composeStallSlice) { return .acquired }
+            if isRetired(req) { return .retired }
+            timedOut += 1
+            if timedOut >= Self.composeStallSlices {
+                #if DEBUG
+                stallVerdictHookForTesting?()
+                #endif
+                return enterStallMode(epoch: req.epoch) ? .stalled : .retired
+            }
+        }
+    }
+
+    /// Acquires the GPU slot on `composeQueue` with no lock held, then encodes and commits. The
+    /// completed frame (or the base layer when composition fails) reaches `orderedDelivery`, which
+    /// reorders by ticket. The completion closure captures `orderedDelivery` strongly and the decoder
+    /// weakly for counters (dolby-vision-fel.md §5.7): a completion that outlives the decoder still calls
+    /// `fulfil`, which drops it once `orderedDelivery`'s epoch has moved on, instead of silently no-oping
+    /// on a `weak self`.
+    ///
+    /// A request retired by a `flush()` or `close()` while it waited is dropped without composing,
+    /// checked both before the slot wait (a queued pre-seek frame does not wait for the GPU) and after it
+    /// (nor spend one). Dropping it is safe: its ticket was retired wholesale with the epoch.
+    ///
+    /// The slot wait is `acquireSlotOrStall`: a GPU that stops completing ends in stall mode, in which a
+    /// request that finds no free slot goes out as its untouched base layer with the mapping-preserving
+    /// RPU, in queue order, instead of waiting. Compositions already on the GPU are left alone
+    /// (`OrderedDelivery`'s stall guard skips the tickets of ones that never complete, and drops a late
+    /// completion of a skipped ticket). Every outcome leaves the backlog once and counts one hand-off.
+    private func composeOnQueue(_ req: ComposeRequest, composer: any FelComposing) {
+        guard !isRetired(req) else {
+            leaveComposeBacklog()
+            composeResultLock.lock(); composeRequestsHandedOff += 1; composeResultLock.unlock()
+            return
+        }
+        // A measurement run (`AETHER_FEL_MEASURE`) composes the base layer a second and third time from
+        // another queue, so the base buffer has to stay intact: those runs use the output pool.
+        let inPlace = FelResidualMeasure.stride == 0 && req.composesIntoBase
+            && composer.canComposeInPlace(baseBuffer: req.base, params: req.params)
+        if !inPlace, !isInStallMode(), let concrete = composer as? DoviFelComposer {
             FelResidualMeasure.sampleIfDue(composer: concrete, base: req.base, enhancement: req.enhancement,
                                            params: req.params, frameIndex: req.frameIndex, pts: req.pts)
         }
-        composeResultLock.lock(); composeRequestsStarted += 1; composeResultLock.unlock()
-        composer.acquireSlot()
+        let outcome = acquireSlotOrStall(req, composer)
+        leaveComposeBacklog()
+        switch outcome {
+        case .retired:
+            composeResultLock.lock(); composeRequestsHandedOff += 1; composeResultLock.unlock()
+            return
+        case .stalled:
+            // No slot, nothing encoded: `req.base` is the intact decoded base layer (also on the in-place
+            // path, where `inPlace` only picks the encode routine), so it goes out as `.baseIntact` does,
+            // with the RPU that keeps the mapping.
+            noteStalledBypass()
+            orderedDelivery.fulfil(
+                ticket: req.ticket, epoch: req.epoch,
+                DeliveredFrame(buffer: SendableBuffer(value: req.base), pts: req.pts, hdr10Data: req.hdr10Data, dmNAL: req.baseLayerNAL)
+            )
+            composeResultLock.lock(); composeRequestsHandedOff += 1; composeResultLock.unlock()
+            return
+        case .acquired:
+            noteComposeProgress()
+        }
+        guard !isRetired(req) else {
+            composer.releaseSlot()
+            composeResultLock.lock(); composeRequestsHandedOff += 1; composeResultLock.unlock()
+            return
+        }
         let fallback = SendableBuffer(value: req.base)
         // Scalars (plus the strongly-captured `delivery`) copied out so the
         // `@Sendable` completion captures no CoreVideo types (Swift 6 mode
@@ -924,8 +1567,41 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let pts = req.pts
         let hdr10Data = req.hdr10Data
         let dmNAL = req.dmNAL
+        let baseLayerNAL = req.baseLayerNAL
         let arrived = req.arrived
         let delivery = orderedDelivery
+        if inPlace {
+            // The decoded base-layer buffer is the compose target. On the software host nothing else reads
+            // it from here until the completion: its own decoder produced it, `req` is the only reference
+            // the pairing queues gave up, the renderer gets it only through `delivery`, and a failure after
+            // the GPU started writing drops the frame (the buffer holds half-composed pixels, so the
+            // base-layer fallback below would show them). On the external-base-layer route the buffer is the
+            // host player's, so this holds only as far as that player never hands it out again, which it
+            // does not promise; the route reaches this branch only when it was opened with `composeInPlace`.
+            composer.composeInPlaceAsyncWithAcquiredSlot(
+                baseBuffer: req.base,
+                enhancementBuffer: req.enhancement,
+                params: req.params,
+                frameIndex: req.frameIndex
+            ) { [weak self] result in
+                self?.recordComposeResult(success: result == .composed)
+                switch result {
+                case .composed, .baseIntact:
+                    if result == .baseIntact {
+                        EngineLog.emit("[DualLayerVideoDecoder] compose failed (\(arrived)): pts=\(String(format: "%.3f", pts.seconds))", category: .swPlayback, level: .verbose)
+                    }
+                    // `.baseIntact` is the raw base layer, so it carries the RPU that still holds the mapping.
+                    delivery.fulfil(ticket: ticket, epoch: epoch, DeliveredFrame(buffer: fallback, pts: pts, hdr10Data: hdr10Data,
+                                                                                 dmNAL: result == .composed ? dmNAL : baseLayerNAL))
+                case .baseCorrupted:
+                    EngineLog.emit("[DualLayerVideoDecoder] compose failed after writing began (\(arrived)): pts=\(String(format: "%.3f", pts.seconds)); frame dropped", category: .swPlayback)
+                    self?.recordInPlaceDrop()
+                    delivery.skip(ticket: ticket, epoch: epoch)
+                }
+                self?.composeResultLock.lock(); self?.composeRequestsHandedOff += 1; self?.composeResultLock.unlock()
+            }
+            return
+        }
         composer.composeAsyncWithAcquiredSlot(
             baseBuffer: req.base,
             enhancementBuffer: req.enhancement,
@@ -936,16 +1612,29 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if composed == nil {
                 EngineLog.emit("[DualLayerVideoDecoder] compose failed (\(arrived)): pts=\(String(format: "%.3f", pts.seconds))", category: .swPlayback, level: .verbose)
             }
+            // The fallback is the raw base layer, so it carries the RPU that still holds the mapping.
             let buffer = SendableBuffer(value: composed ?? fallback.value)
-            delivery.fulfil(ticket: ticket, epoch: epoch, DeliveredFrame(buffer: buffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL))
+            delivery.fulfil(ticket: ticket, epoch: epoch, DeliveredFrame(buffer: buffer, pts: pts, hdr10Data: hdr10Data,
+                                                                         dmNAL: composed != nil ? dmNAL : baseLayerNAL))
             self?.composeResultLock.lock(); self?.composeRequestsHandedOff += 1; self?.composeResultLock.unlock()
         }
+    }
+
+    private func recordInPlaceDrop() {
+        composeResultLock.lock(); summaryInPlaceDropped += 1; composeResultLock.unlock()
     }
 
     private func recordComposeResult(success: Bool) {
         composeResultLock.lock()
         if success { summaryComposedFrames += 1; totalComposedFrames += 1 } else { summaryComposeFailures += 1 }
         composeResultLock.unlock()
+    }
+
+    /// Times the compose queue entered stall mode (the GPU stopped completing), since this decoder was
+    /// created; never reset. For probes and tests.
+    var composeStallCount: Int {
+        composeResultLock.lock(); defer { composeResultLock.unlock() }
+        return totalComposeStalls
     }
 
     /// Frames composed on the GPU so far (bypassed and failed frames are not counted).
@@ -960,11 +1649,19 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // waits for a late enhancement layer keeps its place in decode order.
         // The arrival may also push older waiting frames past K newer frames,
         // which go out here under their own tickets (`due`).
+        // The clock is read before `lock` is taken, so the host's clock lock never nests inside it. The
+        // epoch goes with it: a sample taken before a flush says nothing about the frames after it.
+        let (clockProvider, sampleEpoch): ((@Sendable () -> RenderClockSample?)?, UInt64) = {
+            lock.lock(); defer { lock.unlock() }
+            return (renderClock, _feedEpoch)
+        }()
+        let sampled = clockProvider?()
         let outcome: PairingOutcome
         let due: [BypassRequest]
         (outcome, due) = {
             lock.lock()
             defer { lock.unlock() }
+            let clock = _feedEpoch == sampleEpoch ? sampled : nil
 
             // Defense in depth: VT callbacks still in flight when
             // `close()` runs must not pair, ticket or queue into cleared state.
@@ -976,27 +1673,40 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 // Not a FEL stream or secondary decoder not engaged (e.g. MEL or P8.1 fallback): emit Base Layer directly
                 EngineLog.emit("[DualLayerVideoDecoder] bypass, single layer: isFEL=\(isFEL), isMEL=\(isMEL), enhDecoder=\(enhancementDecoder != nil)", category: .swPlayback, level: .verbose)
                 if isFEL && !isMEL && enhancementDecoder == nil {
-                    summaryBypassNoEL += 1
+                    summaryBypassNoELDecoder += 1
                 }
                 let singleLayerKey = Self.canonicalKey(pts: pts)
-                let dmNAL = resolveDisplayMetadata(key: singleLayerKey)
-                return (.bypass(BypassRequest(ticket: nextDeliveryTicket(), epoch: _feedEpoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, reason: "single-layer")), [])
+                let forms = resolveDisplayMetadata(key: singleLayerKey)
+                return (.bypass(BypassRequest(ticket: nextDeliveryTicket(), epoch: _feedEpoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: forms.baseLayer, reason: "single-layer")), [])
             }
 
             let key = Self.canonicalKey(pts: pts)
             let ticket = nextDeliveryTicket()
             let epoch = _feedEpoch
-            let dmNAL = resolveDisplayMetadata(key: key)
+            let forms = resolveDisplayMetadata(key: key)
+            let dmNAL = forms.composed
+            let baseLayerNAL = forms.baseLayer
             blArrivalSeq &+= 1
             let seq = blArrivalSeq
+            // This frame took a later ticket than everything waiting, and cannot be shown before them.
+            // That can move a waiting frame's due time earlier than the sweep armed for it, so every
+            // exit below re-arms the sweep (`collectDueBypassesAndRearm`), not only the queued one.
+            if pts.isNumeric {
+                for waitingKey in Array(blFrameQueue.keys) {
+                    if let waiting = blFrameQueue[waitingKey] { blFrameQueue[waitingKey]?.deadline = min(waiting.deadline, pts.seconds) }
+                }
+            }
 
             var primary: PairingOutcome
             // A frame without a timestamp has nothing to pair on: it goes out as its base layer now, under
             // the ticket it already holds, rather than waiting for a partner that cannot match it.
             guard key != Int64.min else {
                 EngineLog.emit("[DualLayerVideoDecoder] bypass, no timestamp: base-layer frame has nothing to pair on", category: .swPlayback, level: .verbose)
-                return (.bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, reason: "no-pts")), collectDueBypasses())
+                return (.bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: baseLayerNAL, reason: "no-pts")), collectDueBypassesAndRearm(clock: clock))
             }
+            // Whether the access unit at this time carried no enhancement layer. Consumed either way, but
+            // an enhancement frame already queued for this time wins over it: that frame is a partner.
+            let absentInAU = takeEnhancementAbsent(key: key)
             let mKey: Int64?
             if elFrameQueue[key] != nil {
                 mKey = key
@@ -1012,12 +1722,19 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                     EngineLog.emit("[DualLayerVideoDecoder] bypass, missing RPU: key=\(key)", category: .swPlayback, level: .verbose)
                     summaryBypassNoRPU += 1
                     noteSettledBaseLayer(key: key)
-                    primary = .bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, reason: "missing-rpu"))
-                    return (primary, collectDueBypasses())
+                    primary = .bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: baseLayerNAL, reason: "missing-rpu"))
+                    return (primary, collectDueBypassesAndRearm(clock: clock))
                 }
-                frameIndex &+= 1
+                let frameIndex = nextComposeFrameIndex(pts: pts)
                 noteSettledBaseLayer(key: key)
-                primary = .compose(ComposeRequest(ticket: ticket, epoch: epoch, base: baseBuffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, arrived: "base layer arrived last"))
+                primary = .compose(ComposeRequest(ticket: ticket, epoch: epoch, base: baseBuffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: pts, hdr10Data: hdr10Data, dmNAL: dmNAL, baseLayerNAL: baseLayerNAL, arrived: "base layer arrived last", composesIntoBase: composesIntoBaseBuffers))
+            } else if absentInAU {
+                // Nothing queued and the access unit carried no enhancement layer: nothing is coming,
+                // so it goes out now.
+                EngineLog.emit("[DualLayerVideoDecoder] bypass, no enhancement layer in the access unit: key=\(key)", category: .swPlayback, level: .verbose)
+                summaryBypassNoELInAU += 1
+                noteSettledBaseLayer(key: key)
+                return (.bypass(BypassRequest(ticket: ticket, epoch: epoch, buffer: baseBuffer, pts: pts, hdr10Data: hdr10Data, dmNAL: baseLayerNAL, reason: "no-el-in-au")), collectDueBypassesAndRearm(clock: clock))
             } else {
                 // EL frame has not arrived yet: queue Base Layer frame under its ticket
                 EngineLog.emit("[DualLayerVideoDecoder] queued base layer: pts=\(String(format: "%.3f", pts.seconds)) key=\(key), elCount=\(elFrameQueue.count)", category: .swPlayback, level: .verbose)
@@ -1026,20 +1743,20 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                     // Same canonical key twice: the old entry's ticket would stall
                     // delivery forever if dropped, so bypass it under its ticket,
                     // carrying its stored side data.
-                    displaced = BypassRequest(ticket: old.ticket, epoch: epoch, buffer: old.buffer, pts: old.pts, hdr10Data: old.side.hdr10Data, dmNAL: old.side.dmNAL, reason: "duplicate-key")
+                    displaced = BypassRequest(ticket: old.ticket, epoch: epoch, buffer: old.buffer, pts: old.pts, hdr10Data: old.side.hdr10Data, dmNAL: old.side.baseLayerNAL, reason: "duplicate-key")
                     noteSettledBaseLayer(key: key)
                 }
-                blFrameQueue[key] = (buffer: baseBuffer, pts: pts, ticket: ticket, seq: seq, side: FrameSideData(hdr10Data: hdr10Data, dmNAL: dmNAL))
+                blFrameQueue[key] = (buffer: baseBuffer, pts: pts, ticket: ticket, seq: seq, side: FrameSideData(hdr10Data: hdr10Data, dmNAL: dmNAL, baseLayerNAL: baseLayerNAL), deadline: pts.isNumeric ? pts.seconds : .infinity, arrivedAt: renderClock != nil ? uptimeProvider() : 0)
                 let currentSkew = max(blFrameQueue.count, elFrameQueue.count)
                 if currentSkew > summaryMaxObservedSkew {
                     summaryMaxObservedSkew = currentSkew
                 }
                 primary = .queued
-                var due = collectDueBypasses()
+                var due = collectDueBypassesAndRearm(clock: clock)
                 if let displaced { due.insert(displaced, at: 0) }
                 return (primary, due)
             }
-            return (primary, collectDueBypasses())
+            return (primary, collectDueBypassesAndRearm(clock: clock))
         }()
 
         // Older tickets first; `orderedDelivery` reorders by ticket anyway.
@@ -1096,11 +1813,11 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                     EngineLog.emit("[DualLayerVideoDecoder] bypass, missing RPU: key=\(mKey)", category: .swPlayback, level: .verbose)
                     summaryBypassNoRPU += 1
                     noteSettledBaseLayer(key: mKey)
-                    return .bypass(BypassRequest(ticket: waiting.ticket, epoch: epoch, buffer: waiting.buffer, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: waiting.side.dmNAL, reason: "missing-rpu"))
+                    return .bypass(BypassRequest(ticket: waiting.ticket, epoch: epoch, buffer: waiting.buffer, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: waiting.side.baseLayerNAL, reason: "missing-rpu"))
                 }
-                frameIndex &+= 1
+                let frameIndex = nextComposeFrameIndex(pts: waiting.pts)
                 noteSettledBaseLayer(key: mKey)
-                return .compose(ComposeRequest(ticket: waiting.ticket, epoch: epoch, base: waiting.buffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: dmNAL, arrived: "enhancement layer arrived last"))
+                return .compose(ComposeRequest(ticket: waiting.ticket, epoch: epoch, base: waiting.buffer, enhancement: elBuffer, params: params, frameIndex: frameIndex, pts: waiting.pts, hdr10Data: waiting.side.hdr10Data, dmNAL: dmNAL, baseLayerNAL: waiting.side.baseLayerNAL, arrived: "enhancement layer arrived last", composesIntoBase: composesIntoBaseBuffers))
             } else {
                 // Base Layer frame has not arrived yet: queue EL frame under its own larger cap
                 EngineLog.emit("[DualLayerVideoDecoder] queued enhancement layer: pts=\(String(format: "%.3f", pts.seconds)) key=\(key), blCount=\(blFrameQueue.count)", category: .swPlayback, level: .verbose)
@@ -1142,12 +1859,14 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// - A missing or corrupt RPU may borrow the previous mapping for up to `maxBorrowedParamsRun` frames in
     ///   a row; reshaping and NLQ parameters are constant across a scene. Past that the frame carries none
     ///   and goes out as its base layer.
-    private func recordSideData(key: Int64, params: DoviMetalParams?, dmNAL: [UInt8]?, usesPrevious: Bool, disableResidual: Bool = false) {
+    private func recordSideData(key: Int64, params: DoviMetalParams?, dmNAL: [UInt8]?, baseLayerNAL: [UInt8]? = nil, usesPrevious: Bool, disableResidual: Bool = false) {
         var resolvedParams = params
         var resolvedNAL = dmNAL
+        var resolvedBaseLayerNAL = baseLayerNAL
         if let params {
             lastGoodParams = params
             lastGoodDMNAL = dmNAL
+            lastGoodBaseLayerNAL = baseLayerNAL
             borrowedParamsRun = 0
         } else if let last = lastGoodParams {
             if usesPrevious {
@@ -1158,16 +1877,18 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 if disableResidual { borrowed.flags.insert(.disableResidual) } else { borrowed.flags.remove(.disableResidual) }
                 resolvedParams = borrowed
                 resolvedNAL = dmNAL ?? lastGoodDMNAL
+                resolvedBaseLayerNAL = baseLayerNAL ?? lastGoodBaseLayerNAL
             } else if borrowedParamsRun < Self.maxBorrowedParamsRun {
                 borrowedParamsRun += 1
                 summaryBorrowedParams += 1
                 resolvedParams = last
                 resolvedNAL = dmNAL ?? lastGoodDMNAL
+                resolvedBaseLayerNAL = baseLayerNAL ?? lastGoodBaseLayerNAL
                 EngineLog.emit("[DualLayerVideoDecoder] RPU missing for key=\(key); reusing the previous frame's parameters (\(borrowedParamsRun)/\(Self.maxBorrowedParamsRun))", category: .swPlayback, level: .verbose)
             }
         }
         guard resolvedParams != nil || resolvedNAL != nil else { return }
-        sideDataRing.insert(key: key, params: resolvedParams, dmNAL: resolvedNAL)
+        sideDataRing.insert(key: key, params: resolvedParams, dmNAL: resolvedNAL, baseLayerNAL: resolvedBaseLayerNAL)
     }
 
     /// The parameters `recordSideData` resolved for `key`, nil when the frame has none. The caller holds `lock`.
@@ -1190,24 +1911,167 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
-    /// Bypasses every queued base-layer frame that has seen K newer base-layer
-    /// arrivals, oldest first, each under the ticket its arrival took.
-    /// The caller holds `lock`.
-    private func collectDueBypasses() -> [BypassRequest] {
+    /// Records that the access unit at `key` carried no enhancement layer. The caller holds `lock`.
+    func noteEnhancementAbsent(key: Int64) {
+        elAbsentKeys.append(key)
+        if elAbsentKeys.count > Self.settledKeyMemory { elAbsentKeys.removeFirst(elAbsentKeys.count - Self.settledKeyMemory) }
+    }
+
+    /// Removes and reports whether `key` was noted as having no enhancement layer. The caller holds `lock`.
+    private func takeEnhancementAbsent(key: Int64) -> Bool {
+        guard let i = elAbsentKeys.firstIndex(where: { FrameSideDataRing.isWithinJitter($0, key) }) else { return false }
+        elAbsentKeys.remove(at: i)
+        return true
+    }
+
+    /// The rule that released a waiting base frame without its partner.
+    private enum ReleaseCause {
+        case deadline, heldWall, backstop
+
+        var reason: String {
+            switch self {
+            case .deadline: return "no-el-deadline"
+            case .heldWall: return "no-el-held-wall"
+            case .backstop: return "no-el-backstop"
+            }
+        }
+    }
+
+    /// Releases every queued base-layer frame that can no longer wait for its enhancement layer, oldest
+    /// first, each under the ticket its arrival took. The caller holds `lock`.
+    ///
+    /// With a running render clock a frame is due once its presentation time less the margin
+    /// (`deadlineMargin`) has been reached, and not before `enhancementGrace` has passed since it
+    /// arrived: a frame that arrives already inside its margin gets that long for a partner that is only
+    /// a moment behind. A frame already at or past its presentation time gets no grace. Its presentation
+    /// time is the earliest of its own and every later-ticket frame's, since delivery is ordered by
+    /// ticket and the frame behind it cannot show first. With the clock held
+    /// there is no presentation time to count down to: for a start that waits on the renderer (a preroll
+    /// after a seek) it waits the margin of wall time at most; for a pause, or before the clock is armed,
+    /// nothing is late and it waits `heldClockWallBound`. With no clock at all it is released by the count
+    /// of newer arrivals (`maxLayerSkewFrames`). A count of `maxDeadlineHoldFrames` releases it in every
+    /// mode with a clock.
+    private func collectDueBypasses(clock: RenderClockSample?) -> [BypassRequest] {
+        let hasClock = renderClock != nil
+        let margin = deadlineMargin
+        let now = hasClock ? uptimeProvider() : 0
         var due: [BypassRequest] = []
         for k in blFrameQueue.keys.sorted() {
-            guard let entry = blFrameQueue[k],
-                  blArrivalSeq &- entry.seq >= UInt64(Self.maxLayerSkewFrames) else { continue }
+            guard let entry = blFrameQueue[k] else { continue }
+            let newer = blArrivalSeq &- entry.seq
+            let waited = now - entry.arrivedAt
+            let cause: ReleaseCause?
+            if !hasClock {
+                cause = newer >= UInt64(Self.maxLayerSkewFrames) ? .backstop : nil
+            } else if newer >= UInt64(Self.maxDeadlineHoldFrames) {
+                cause = .backstop
+            } else if let clock, clock.running, clock.seconds.isFinite {
+                cause = waited >= graceFor(deadline: entry.deadline, clockSeconds: clock.seconds) && entry.deadline - margin <= clock.seconds ? .deadline : nil
+            } else {
+                let bound = clock?.prerolling == true ? margin : Self.heldClockWallBound
+                cause = waited >= bound ? .heldWall : nil
+            }
+            guard let cause else { continue }
             blFrameQueue.removeValue(forKey: k)
-            summaryBypassNoEL += 1
-            EngineLog.emit("[DualLayerVideoDecoder] bypass, no enhancement layer arrived: pts=\(String(format: "%.3f", entry.pts.seconds)) key=\(k)", category: .swPlayback, level: .verbose)
+            switch cause {
+            case .deadline: summaryBypassDeadline += 1
+            case .heldWall: summaryBypassHeldWall += 1
+            case .backstop: summaryBypassBackstop += 1
+            }
+            EngineLog.emit("[DualLayerVideoDecoder] bypass, no enhancement layer arrived (\(cause.reason)): pts=\(String(format: "%.3f", entry.pts.seconds)) key=\(k)", category: .swPlayback, level: .verbose)
             noteSettledBaseLayer(key: k)
-            due.append(BypassRequest(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts, hdr10Data: entry.side.hdr10Data, dmNAL: entry.side.dmNAL, reason: "no-el"))
+            due.append(BypassRequest(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts, hdr10Data: entry.side.hdr10Data, dmNAL: entry.side.baseLayerNAL, reason: cause.reason))
         }
-        // Every arrival takes a new `seq`, so what survives the loop arrived within the last
-        // `maxLayerSkewFrames` base frames: the queue is bounded by the skew rule alone.
-        assert(blFrameQueue.count <= Self.maxLayerSkewFrames)
+        assert(blFrameQueue.count <= (hasClock ? Self.maxDeadlineHoldFrames : Self.maxLayerSkewFrames))
         return due
+    }
+
+    /// `collectDueBypasses`, then arms the next sweep for whatever still waits (a no-op with nothing
+    /// waiting). An arrival can lower a waiting frame's deadline whichever way it is itself handled, so
+    /// the sweep armed for the old, later time has to be replaced by one for the new time. The caller
+    /// holds `lock`.
+    private func collectDueBypassesAndRearm(clock: RenderClockSample?) -> [BypassRequest] {
+        let due = collectDueBypasses(clock: clock)
+        scheduleDeadlineSweepIfNeeded(clock: clock)
+        return due
+    }
+
+    /// Re-checks the waiting frames against the clock between arrivals: the deadline passes with
+    /// time, and no arrival need come to say so. One sweep is armed at a time, for the earliest moment
+    /// any waiting frame can become due (`nextSweepDelay`).
+    private static let deadlineSweepQueue = DispatchQueue(label: "aether.dovi.deadline-sweep", qos: .userInteractive)
+    /// Bounds on the wait to the next sweep: never a busy loop, and never so long that a rate change or a
+    /// moved clock goes unnoticed.
+    static let minSweepDelay: TimeInterval = 0.002
+    static let maxSweepDelay: TimeInterval = 0.25
+
+    /// Seconds until the first waiting frame could be released by time alone, from `now`, clamped to the
+    /// sweep bounds; nil when nothing waits. The caller holds `lock`.
+    private func nextSweepDelay(clock: RenderClockSample?, now: TimeInterval) -> TimeInterval? {
+        guard !blFrameQueue.isEmpty else { return nil }
+        let margin = deadlineMargin
+        var earliest = Double.infinity
+        for entry in blFrameQueue.values {
+            let due: TimeInterval
+            if let clock, clock.running, clock.seconds.isFinite {
+                // Media time to wall time at the host's rate (the engine plays at 0.5 to 2).
+                let untilDeadline = (entry.deadline - margin - clock.seconds) / max(clock.rate, 0.5)
+                // The grace ends at the earlier of its own end and the presentation time, where it drops to
+                // none: a frame whose time falls inside its grace is due then, not when the grace is over.
+                let graceEnd = entry.arrivedAt + graceFor(deadline: entry.deadline, clockSeconds: clock.seconds) - now
+                let untilPresentation = (entry.deadline - clock.seconds) / max(clock.rate, 0.5)
+                due = max(min(graceEnd, untilPresentation), untilDeadline)
+            } else {
+                due = entry.arrivedAt + (clock?.prerolling == true ? margin : Self.heldClockWallBound) - now
+            }
+            earliest = min(earliest, due)
+        }
+        return min(max(earliest, Self.minSweepDelay), Self.maxSweepDelay)
+    }
+
+    /// Arms the next sweep for the earliest due time, replacing an armed one that would fire later.
+    /// Caller holds `lock`.
+    private func scheduleDeadlineSweepIfNeeded(clock: RenderClockSample?) {
+        guard renderClock != nil, !isClosed, !draining else { return }
+        let now = uptimeProvider()
+        guard let delay = nextSweepDelay(clock: clock, now: now) else { return }
+        let fire = now + delay
+        if deadlineSweepScheduled, sweepFireUptime <= fire + 0.001 { return }
+        sweepGeneration &+= 1
+        let generation = sweepGeneration
+        deadlineSweepScheduled = true
+        sweepFireUptime = fire
+        Self.deadlineSweepQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.runDeadlineSweep(generation: generation)
+        }
+    }
+
+    /// Internal rather than private so tests can drive it without waiting on the timer.
+    func runDeadlineSweep() {
+        runDeadlineSweep(generation: nil)
+    }
+
+    /// `generation` is the timer's own; one that has been replaced since does nothing.
+    private func runDeadlineSweep(generation: UInt64?) {
+        lock.lock()
+        if let generation, generation != sweepGeneration { lock.unlock(); return }
+        // Whatever else is armed is stale from here: this sweep re-arms as needed.
+        sweepGeneration &+= 1
+        deadlineSweepScheduled = false
+        let provider = renderClock
+        let epoch = _feedEpoch
+        lock.unlock()
+        let clock = provider?()
+        let due: [BypassRequest] = {
+            lock.lock()
+            defer { lock.unlock() }
+            // Draining or flushed meanwhile: the queue it was for is gone, and the next arrival re-arms.
+            guard !isClosed, !draining, _feedEpoch == epoch else { return [] }
+            let due = collectDueBypasses(clock: clock)
+            scheduleDeadlineSweepIfNeeded(clock: clock)
+            return due
+        }()
+        for req in due { fulfilBypass(req) }
     }
 
     #if DEBUG
@@ -1215,6 +2079,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Sees every summary line with the level it went out at. `.verbose` lines never reach
     /// `EngineLog.handler`, so a test cannot observe them there.
     var summarySinkForTesting: ((String, EngineLog.Level) -> Void)?
+    /// Sees every info-level totals line (`totalsLine`).
+    var totalsSinkForTesting: ((String) -> Void)?
     #endif
 
     // MARK: - Observability (dolby-vision-fel.md §5.11)
@@ -1245,40 +2111,106 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         composeResultLock.lock()
         let composed = summaryComposedFrames
         let composeFailures = summaryComposeFailures
+        let inPlaceDropped = summaryInPlaceDropped
+        let composeStalledBypasses = summaryBypassComposeStalled
+        let bypassQueueWaitMaxMs = summaryBypassQueueWaitMaxMs
         summaryComposedFrames = 0
         summaryComposeFailures = 0
+        summaryInPlaceDropped = 0
+        summaryBypassComposeStalled = 0
+        summaryBypassQueueWaitMaxMs = 0
         composeResultLock.unlock()
-        let noEL = summaryBypassNoEL
+        let noELInAU = summaryBypassNoELInAU
+        let deadline = summaryBypassDeadline
+        let heldWall = summaryBypassHeldWall
+        let backstop = summaryBypassBackstop
+        let noELDecoder = summaryBypassNoELDecoder
+        let endOfStream = summaryBypassEndOfStream
         let noRPU = summaryBypassNoRPU
+        let mappingFallback = summaryMappingFallback
         let staleEL = summaryDropStaleEL
         let prunedEL = summaryPrunedEL
         let borrowedParams = summaryBorrowedParams
         let skew = summaryMaxObservedSkew
-        summaryBypassNoEL = 0
+        summaryBypassNoELInAU = 0
+        summaryBypassDeadline = 0
+        summaryBypassHeldWall = 0
+        summaryBypassBackstop = 0
+        summaryBypassNoELDecoder = 0
+        summaryBypassEndOfStream = 0
         summaryBypassNoRPU = 0
+        summaryMappingFallback = 0
         summaryDropStaleEL = 0
         summaryPrunedEL = 0
         summaryBorrowedParams = 0
         summaryMaxObservedSkew = max(blFrameQueue.count, elFrameQueue.count)
         lastSummaryTimestamp = now
+        totalComposed += composed
+        totalBypassDeadline += deadline
+        totalBypassHeldWall += heldWall
+        totalBypassBackstop += backstop
+        let totalsSum = totalComposed + totalBypassDeadline + totalBypassHeldWall + totalBypassBackstop
+        var totalsLine: String?
+        if totalsSum != lastLoggedTotalsSum,
+           lastTotalsLogTimestamp.map({ now - $0 >= Self.totalsLogIntervalSeconds }) ?? true {
+            lastTotalsLogTimestamp = now
+            lastLoggedTotalsSum = totalsSum
+            totalsLine = Self.totalsLine(composed: totalComposed, bypassDeadline: totalBypassDeadline,
+                                         bypassHeldWall: totalBypassHeldWall, bypassBackstop: totalBypassBackstop)
+        }
         let activeComposer = composer
+        let frameRate = streamFrameRate
         lock.unlock()
 
         let slots = activeComposer?.takePeakSlotsInUse() ?? 0
         let poolBuffers = activeComposer?.allocatedPoolBuffers ?? 0
+        let inPlaceTotal = activeComposer?.inPlaceComposedFrames ?? 0
         let gpuMs = activeComposer?.meanGPUTimeMs
         let pendingPeak = orderedDelivery.takePeakPendingCount()
         let gpuStr = gpuMs.map { String(format: "%.1f", $0) } ?? "n/a"
-        let line = "[DualLayerVideoDecoder] summary: composed=\(composed), composeFailures=\(composeFailures), bypassNoEL=\(noEL), bypassNoRPU=\(noRPU), staleELDropped=\(staleEL), prunedEL=\(prunedEL), borrowedParams=\(borrowedParams), maxSkew=\(skew), peakGpuSlots=\(slots), poolBuffers=\(poolBuffers), deliveryPendingPeak=\(pendingPeak), meanGpuMs=\(gpuStr)"
+        let line = "[DualLayerVideoDecoder] summary: composed=\(composed), composeFailures=\(composeFailures), bypassNoELInAU=\(noELInAU), bypassDeadline=\(deadline), bypassHeldWall=\(heldWall), bypassBackstop=\(backstop), bypassNoELDecoder=\(noELDecoder), bypassEndOfStream=\(endOfStream), bypassNoRPU=\(noRPU), mappingFallback=\(mappingFallback), staleELDropped=\(staleEL), prunedEL=\(prunedEL), borrowedParams=\(borrowedParams), maxSkew=\(skew), peakGpuSlots=\(slots), poolBuffers=\(poolBuffers), inPlaceTotal=\(inPlaceTotal), inPlaceDropped=\(inPlaceDropped), bypassComposeStalled=\(composeStalledBypasses), bypassQueueWaitMaxMs=\(String(format: "%.1f", bypassQueueWaitMaxMs)), deliveryPendingPeak=\(pendingPeak), meanGpuMs=\(gpuStr)"
         // Once a second is a trace, not an event: it goes to OSLog's debug level only. An interval in
         // which a composition failed is the exception, so the failure reaches the default level and the
         // host handler.
-        let level: EngineLog.Level = composeFailures > 0 ? .info : .verbose
+        let level: EngineLog.Level = composeFailures > 0 || inPlaceDropped > 0 || composeStalledBypasses > 0 ? .info : .verbose
         EngineLog.emit(line, category: .swPlayback, level: level)
         #if DEBUG
         summarySinkForTesting?(line, level)
         #endif
+        if let totalsLine {
+            EngineLog.emit(totalsLine, category: .swPlayback, level: .info)
+            #if DEBUG
+            totalsSinkForTesting?(totalsLine)
+            #endif
+        }
+        if let gpuMs, Self.composeCannotKeepUp(meanGpuMs: gpuMs, frameRate: frameRate) {
+            lock.lock()
+            let firstTime = !composeCannotKeepUpWarned
+            composeCannotKeepUpWarned = true
+            lock.unlock()
+            if firstTime {
+                EngineLog.emit("[DualLayerVideoDecoder] compositions cannot keep up with the stream's frame rate: mean GPU time \(String(format: "%.1f", gpuMs)) ms exceeds the frame interval \(String(format: "%.1f", 1000 / (frameRate ?? 1))) ms", category: .swPlayback)
+            }
+        }
         activeComposer?.flushTextureCache()
+    }
+
+    /// Seconds between `[DualLayerVideoDecoder] totals` lines.
+    static let totalsLogIntervalSeconds: TimeInterval = 10.0
+
+    /// The session totals of the deadline-bypass counters, at the default log level, so a device run
+    /// can judge them from the host's log without a verbose trace. Rate limited and sent only when a
+    /// count moved since the last one (`maybeEmitSummary`).
+    static func totalsLine(composed: Int, bypassDeadline: Int, bypassHeldWall: Int, bypassBackstop: Int) -> String {
+        "[DualLayerVideoDecoder] totals: composed=\(composed), bypassDeadline=\(bypassDeadline), bypassHeldWall=\(bypassHeldWall), bypassBackstop=\(bypassBackstop)"
+    }
+
+    /// Whether compositions take longer than frames arrive. Compositions share one serial GPU queue, so
+    /// when the mean GPU time exceeds the frame interval no in-flight limit keeps up with the stream.
+    /// False when the frame rate is unknown.
+    static func composeCannotKeepUp(meanGpuMs: Double, frameRate: Double?) -> Bool {
+        guard let frameRate, frameRate > 0 else { return false }
+        return meanGpuMs > 1000 / frameRate
     }
 
     // MARK: - Flush & Teardown
@@ -1320,6 +2252,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.lock()
         guard !isClosed else { lock.unlock(); return }
         _feedEpoch &+= 1
+        // A feed parked on a full compose backlog returns to the seek now, and stall mode ends with the
+        // epoch (`composeBacklog` is a leaf, taken under `lock`; the log waits until `lock` is released).
+        let clearedStall = resetComposeBacklog(epoch: _feedEpoch)
         draining = true
         // Here, not with the queues below: the demux thread may feed post-seek packets while this
         // thread waits on the drain, and those must start from the next IRAP.
@@ -1329,8 +2264,10 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // exist, and not after the drain.
         lastGoodParams = nil
         lastGoodDMNAL = nil
+        lastGoodBaseLayerNAL = nil
         borrowedParamsRun = 0
         sideDataRing.removeAll()
+        elAbsentKeys.removeAll()
         let epoch = _feedEpoch
         let nextTicket = deliveryNextTicket
         let primary = primaryDecoder
@@ -1349,6 +2286,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         el?.adoptFeedEpoch(epoch)
         orderedDelivery.resetAsync(epoch: epoch, nextTicket: nextTicket)
         lock.unlock()
+        if clearedStall {
+            EngineLog.emit("[DualLayerVideoDecoder] compose stall cleared by flush", category: .swPlayback)
+        }
 
         #if DEBUG
         // Test seam only: lets a test drive a ticket through the window a
@@ -1383,8 +2323,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // `skipUntilPTS` pre-roll discards anyway until the seek target; and a dropped output frame
         // does not affect decoding, VideoToolbox's reference state is intact. What it can cost is
         // pairing: a frame dropped on one layer and not on the other leaves its partner waiting, and
-        // a waiting base frame goes out base-layer only once `maxLayerSkewFrames` newer ones have
-        // arrived. So the first few frames after a seek can be base-layer only (how many depends on
+        // a waiting base frame goes out base-layer only when its display deadline passes (or the
+        // wall bound or the count backstop of 7 newer tickets is hit). So the first few frames after a seek can be base-layer only (how many depends on
         // how many frames the two sessions output during the drain), and the base frames dropped
         // during the drain are never shown.
         primary.flushKeepingEpoch()
@@ -1396,11 +2336,30 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         draining = false
         blFrameQueue.removeAll()
         elFrameQueue.removeAll()
+        deadlineSweepScheduled = false
+        sweepGeneration &+= 1
         blArrivalSeq = 0
         settledBlKeys.removeAll()
-        composeResultLock.lock(); summaryComposedFrames = 0; summaryComposeFailures = 0; composeResultLock.unlock()
-        summaryBypassNoEL = 0
+        // The session totals survive a flush, so the counts of the interval in progress are folded
+        // into them before the per-second counters are zeroed.
+        composeResultLock.lock()
+        totalComposed += summaryComposedFrames
+        summaryComposedFrames = 0
+        summaryComposeFailures = 0
+        summaryInPlaceDropped = 0
+        composeResultLock.unlock()
+        totalBypassDeadline += summaryBypassDeadline
+        totalBypassHeldWall += summaryBypassHeldWall
+        totalBypassBackstop += summaryBypassBackstop
+        composeResultLock.lock(); summaryBypassComposeStalled = 0; summaryBypassQueueWaitMaxMs = 0; composeResultLock.unlock()
+        summaryBypassNoELInAU = 0
+        summaryBypassDeadline = 0
+        summaryBypassHeldWall = 0
+        summaryBypassBackstop = 0
+        summaryBypassNoELDecoder = 0
+        summaryBypassEndOfStream = 0
         summaryBypassNoRPU = 0
+        summaryMappingFallback = 0
         summaryDropStaleEL = 0
         summaryPrunedEL = 0
         summaryBorrowedParams = 0
@@ -1442,9 +2401,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             var due: [BypassRequest] = []
             for k in blFrameQueue.keys.sorted() {
                 guard let entry = blFrameQueue.removeValue(forKey: k) else { continue }
-                summaryBypassNoEL += 1
+                summaryBypassEndOfStream += 1
                 noteSettledBaseLayer(key: k)
-                due.append(BypassRequest(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts, hdr10Data: entry.side.hdr10Data, dmNAL: entry.side.dmNAL, reason: "end-of-stream"))
+                due.append(BypassRequest(ticket: entry.ticket, epoch: _feedEpoch, buffer: entry.buffer, pts: entry.pts, hdr10Data: entry.side.hdr10Data, dmNAL: entry.side.baseLayerNAL, reason: "end-of-stream"))
             }
             return due
         }()
@@ -1521,25 +2480,43 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // larger epoch.
         lock.lock()
         _feedEpoch &+= 1
+        let clearedStall = resetComposeBacklog(epoch: _feedEpoch)   // as in `flush()`: teardown never waits for the GPU
         draining = false
         deliveryNextTicket = 0
         pictureAlignment = Self.makeAlignment()
         blFrameQueue.removeAll()
         elFrameQueue.removeAll()
+        elAbsentKeys.removeAll()
+        deadlineSweepScheduled = false
+        sweepGeneration &+= 1
         blArrivalSeq = 0
         settledBlKeys.removeAll()
         lastGoodParams = nil
         lastGoodDMNAL = nil
+        lastGoodBaseLayerNAL = nil
         borrowedParamsRun = 0
         sideDataRing.removeAll()
-        composeResultLock.lock(); summaryComposedFrames = 0; summaryComposeFailures = 0; composeResultLock.unlock()
-        summaryBypassNoEL = 0
+        composeResultLock.lock(); summaryComposedFrames = 0; summaryComposeFailures = 0; summaryInPlaceDropped = 0; summaryBypassComposeStalled = 0; summaryBypassQueueWaitMaxMs = 0; composeResultLock.unlock()
+        summaryBypassNoELInAU = 0
+        summaryBypassDeadline = 0
+        summaryBypassHeldWall = 0
+        summaryBypassBackstop = 0
+        summaryBypassNoELDecoder = 0
+        summaryBypassEndOfStream = 0
         summaryBypassNoRPU = 0
+        summaryMappingFallback = 0
+        loggedMappingFallback = false
         summaryDropStaleEL = 0
         summaryPrunedEL = 0
         summaryBorrowedParams = 0
         summaryMaxObservedSkew = 0
         lastSummaryTimestamp = 0
+        totalComposed = 0
+        totalBypassDeadline = 0
+        totalBypassHeldWall = 0
+        totalBypassBackstop = 0
+        lastTotalsLogTimestamp = nil
+        lastLoggedTotalsSum = 0
         isFEL = false
         isMEL = false
         streamClassified = false
@@ -1553,6 +2530,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         elPPS = nil
         enhancementOpenFailure = nil
         timeBase = AVRational(num: 1, den: 90000)
+        streamFrameRate = nil
         _skipUntilPTS = nil
         isClosed = true
         let epoch = _feedEpoch
@@ -1564,6 +2542,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         enhancementDecoder = nil
         orderedDelivery.resetAsync(epoch: epoch, nextTicket: nextTicket)
         lock.unlock()
+        if clearedStall {
+            EngineLog.emit("[DualLayerVideoDecoder] compose stall cleared by close", category: .swPlayback)
+        }
 
         // Same guarantee as `flush()`: nothing tagged with the
         // pre-close epoch reaches `onFrame` after this returns. Clearing the
@@ -1602,9 +2583,28 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// instead of waiting on a sub-microsecond production race.
     var flushRaceHookForTesting: (() -> Void)?
 
+    /// Runs on the compose queue, with no lock held, between the last retired check and the stall verdict,
+    /// so a test can land a `flush()` or `close()` in that window. Set before frames are fed.
+    var stallVerdictHookForTesting: (() -> Void)?
+
     /// Called at the top of every `flush()`, before it queues for `lifecycleLock`. Lets a test know a
     /// second flush has reached the lock without sleeping to find out.
     var flushWillTakeLifecycleLockHookForTesting: (() -> Void)?
+
+    /// The current feed epoch, for tests that call `waitForComposeBacklog(entryEpoch:)` as `decode(packet:)` does.
+    var feedEpochForTesting: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return _feedEpoch
+    }
+
+    var isComposeStalledForTesting: Bool { isInStallMode() }
+
+    /// Compositions and bypasses handed to the compose queue and not yet handed to `orderedDelivery` (or
+    /// dropped as retired): started minus handed off.
+    var outstandingComposeRequestsForTesting: Int {
+        composeResultLock.lock(); defer { composeResultLock.unlock() }
+        return composeRequestsStarted - composeRequestsHandedOff
+    }
 
     /// Waits until every composition started so far has finished and handed its frame to
     /// `orderedDelivery`, then until that queue has run everything enqueued ahead of this call. After
@@ -1621,6 +2621,14 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             usleep(500)
         }
         orderedDelivery.barrier()
+    }
+
+    /// Sets the composition counter that drives the dither's frame parity (it counts compositions since the
+    /// last flush). A test that compares pictures from two decoders needs both on the same parity, because a
+    /// seek lands on a different keyframe in two layouts of one title and the counter then differs by an odd
+    /// number while the pictures are the same.
+    func setFrameIndexForTesting(_ value: UInt32) {
+        lock.lock(); frameIndex = value; lock.unlock()
     }
 
     /// Invalidates both layers' sessions without forgetting them, as the system does on an iOS screen
@@ -1651,6 +2659,13 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         orderedDelivery.fulfil(
             ticket: ticket, epoch: epoch,
             DeliveredFrame(buffer: SendableBuffer(value: buffer), pts: pts, hdr10Data: nil, dmNAL: nil))
+    }
+    #endif
+
+    #if DEBUG
+    /// Whether a frame from the base-layer decoder would be modifiable with no flag from VideoToolbox.
+    var primaryOutputIsModifiableForTesting: Bool {
+        (primaryDecoder as? HardwareVideoDecoder)?.outputIsModifiable([]) ?? false
     }
     #endif
 
@@ -1758,6 +2773,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var deliveryPendingCount: Int
         var deliveryNextTicket: UInt64
         var deliveryNextToEmit: UInt64
+        var deliveryStallSkippedTickets: UInt64
         var feedEpoch: UInt64
         var draining: Bool
         var timeBaseNum: Int32
@@ -1820,6 +2836,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             deliveryPendingCount: orderedDelivery.pendingCountForTesting,
             deliveryNextTicket: deliveryNextTicket,
             deliveryNextToEmit: orderedDelivery.nextToEmitForTesting,
+            deliveryStallSkippedTickets: orderedDelivery.stallSkippedTicketsForTesting,
             feedEpoch: feedEpoch,
             draining: draining,
             timeBaseNum: timeBaseNum,
@@ -1836,15 +2853,39 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
     }
 
-    /// Caches what `decode(packet:)` would have cached for the packet at `pts`: the composer's
-    /// reshaping parameters and the Profile 8.1 RPU NAL attached as display metadata.
+    /// Notes that the access unit at `pts` carried no enhancement layer, whatever the stream. The rule
+    /// that a reordered stream makes no such note lives in `decode(packet:)`; tests of it feed access
+    /// units through that path instead of this one.
+    func noteEnhancementAbsentForTesting(pts: CMTime) {
+        lock.lock()
+        defer { lock.unlock() }
+        noteEnhancementAbsent(key: Self.canonicalKey(pts: pts))
+    }
+
+    /// Marks the primary session as open, so `decode(packet:)` runs past its readiness gate in tests
+    /// that feed access units through the real path with a stand-in primary decoder.
+    func markPrimaryDecoderOpenForTesting() {
+        lock.lock()
+        defer { lock.unlock() }
+        primaryDecoderInitialized = true
+    }
+
+    /// Whether a deadline sweep is armed, and how many access units are noted as having no enhancement layer.
+    var deadlineSweepArmedForTesting: Bool { lock.lock(); defer { lock.unlock() }; return deadlineSweepScheduled }
+    /// The uptime the armed sweep fires at, nil when none is armed.
+    var armedSweepFireUptimeForTesting: TimeInterval? {
+        lock.lock(); defer { lock.unlock() }
+        return deadlineSweepScheduled ? sweepFireUptime : nil
+    }
+    var absentEnhancementKeyCountForTesting: Int { lock.lock(); defer { lock.unlock() }; return elAbsentKeys.count }
+
     /// One call is one packet, in decode order: a nil `params` is a packet with a missing RPU (or, with
     /// `usesPrevious`, one that says to keep the previous mapping), resolved exactly as in production.
-    func seedRPUForTesting(pts: CMTime, params: DoviMetalParams?, displayMetadataNAL: [UInt8]?, usesPrevious: Bool = false, disableResidual: Bool = false) {
+    func seedRPUForTesting(pts: CMTime, params: DoviMetalParams?, displayMetadataNAL: [UInt8]?, baseLayerNAL: [UInt8]? = nil, usesPrevious: Bool = false, disableResidual: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
         let key = Self.canonicalKey(pts: pts)
-        recordSideData(key: key, params: params, dmNAL: displayMetadataNAL, usesPrevious: usesPrevious, disableResidual: disableResidual)
+        recordSideData(key: key, params: params, dmNAL: displayMetadataNAL, baseLayerNAL: baseLayerNAL, usesPrevious: usesPrevious, disableResidual: disableResidual)
     }
 }
 #endif

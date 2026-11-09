@@ -3,28 +3,14 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Measurement only, in a build with the TrueHDReferenceRender trait: with this environment variable
-/// set to 1, TrueHD Atmos is decoded exactly and its objects mixed into the layout, the rendering
-/// `BedSplitter` is compared against. Without the trait it is always off and that path is not built.
-enum TrueHDReferenceRender {
-    static let variable = "AETHER_TRUEHD_REFERENCE_RENDER"
-    static var isOn: Bool {
-        #if TrueHDReferenceRender
-        ProcessInfo.processInfo.environment[variable] == "1"
-        #else
-        false
-        #endif
-    }
-}
-
 extension HLSVideoEngine {
 
     /// The object-audio format a source would be rendered as, before it is confirmed.
     enum ObjectAudioSource: Equatable {
         /// TrueHD that FFmpeg marked Atmos.
         case trueHDAtmos
-        /// Lossless DTS-HD Master Audio, which may carry DTS:X whatever FFmpeg's label says, so
-        /// LibDTSX decides on its first frames (see `dtsxVerdict`).
+        /// Lossless DTS-HD Master Audio, which may carry DTS:X whatever the probe's label says, so its
+        /// first decoded frame decides (see `dtsxVerdict`).
         case dtsHDMasterAudio
 
         /// How the log and the pipeline description name it.
@@ -95,19 +81,29 @@ extension HLSVideoEngine {
     }
 
     #if DTSXObjectAudio
-    /// Packets of the source's head `dtsxVerdict` may look at. LibDTSX needs three frames of the
-    /// track, which a muxed file interleaves within the first few dozen packets; the same budget as
-    /// the planner's head scans bounds a file whose audio starts late.
+    /// Packets of the source's head `dtsxVerdict` may look at. A DTS:X track renders on its first
+    /// frame, which the decoder's parser hands over once the second starts, and is refused after
+    /// eight frames without heights; a muxed file interleaves those within the first few dozen
+    /// packets. The same budget as the planner's head scans bounds a file whose audio starts late.
     static let dtsxVerdictPacketBudget = 512
     /// Bytes the peek may hold. Unlike the planner's scans, peeked packets stay resident until the
     /// producer reads them, video included, so a late-starting track in a 4K remux must not pin
-    /// hundreds of megabytes; three DTS-HD frames normally sit within the first few of them.
+    /// hundreds of megabytes; the frames a verdict needs normally sit within the first few of them.
     static let dtsxVerdictByteBudget = 24 << 20
 
-    /// Shows LibDTSX the audio stream's first packets, without consuming them (the producer reads the
+    /// Shows the DTS:X decoder the audio stream's first packets, without consuming them (the producer reads the
     /// same packets afterwards), until it says whether the track is DTS:X it renders. Nil when a
     /// budget ran out or the source could not be read first.
     func dtsxVerdict(
+        decoder: DTSXObjectAudioDecoder,
+        demuxer: Demuxer,
+        streamIndex: Int32
+    ) -> DTSXObjectAudioDecoder.Verdict? {
+        Self.dtsxVerdict(decoder: decoder, demuxer: demuxer, streamIndex: streamIndex)
+    }
+
+    /// The verdict without an engine, for the software host, which renders the same bed.
+    static func dtsxVerdict(
         decoder: DTSXObjectAudioDecoder,
         demuxer: Demuxer,
         streamIndex: Int32
@@ -144,19 +140,40 @@ extension HLSVideoEngine {
         streamIndex: Int32
     ) {
         let par = audioStream.pointee.codecpar.pointee
-        guard par.codec_id == AV_CODEC_ID_TRUEHD, par.profile == AV_PROFILE_UNKNOWN,
-              objectAudioRendering.layout != nil, ObjectAudioSource.trueHDAtmos.isBuiltIn,
+        guard Self.needsTrueHDMajorSyncVerdict(
+                codecID: par.codec_id, profile: par.profile, rendering: objectAudioRendering),
               !isLiveSession
         else { return }
         if audioDemuxer === demuxer {
             seekToInitialProducerStart(audioDemuxer)
             demuxerAtInitialProducerStart = true
         }
+        let peek = Self.trueHDMajorSyncVerdict(demuxer: audioDemuxer, streamIndex: streamIndex)
+        if peek.isAtmos == true { audioStream.pointee.codecpar.pointee.profile = AV_PROFILE_TRUEHD_ATMOS }
+        EngineLog.emit("[HLSVideoEngine] \(peek.summary)", category: .session)
+    }
+
+    /// Whether a track is the one `trueHDMajorSyncVerdict` exists for: TrueHD whose profile the probe
+    /// left unknown, in a session that wants object rendering from a build that renders TrueHD Atmos.
+    static func needsTrueHDMajorSyncVerdict(
+        codecID: AVCodecID, profile: Int32, rendering: ObjectAudioRendering
+    ) -> Bool {
+        codecID == AV_CODEC_ID_TRUEHD && profile == AV_PROFILE_UNKNOWN
+            && rendering.layout != nil && ObjectAudioSource.trueHDAtmos.isBuiltIn
+    }
+
+    /// Reads the first major sync of the stream's packets from where the demuxer stands, without
+    /// consuming them, within `trueHDVerdictPacketBudget` / `trueHDVerdictByteBudget`. `isAtmos` is
+    /// nil when no major sync turned up; `summary` is the session log line, which the loopback route
+    /// (`resolveUnlabelledTrueHDAtmos`) and the software host both write.
+    static func trueHDMajorSyncVerdict(
+        demuxer: Demuxer, streamIndex: Int32
+    ) -> (isAtmos: Bool?, summary: String) {
         let started = DispatchTime.now()
         var verdict: Bool?
         var heldBytes = 0
         var packets = 0
-        try? audioDemuxer.peekPackets(maxPackets: Self.trueHDVerdictPacketBudget) { packet in
+        try? demuxer.peekPackets(maxPackets: Self.trueHDVerdictPacketBudget) { packet in
             packets += 1
             heldBytes += Int(max(packet.pointee.size, 0))
             if heldBytes > Self.trueHDVerdictByteBudget { return true }
@@ -169,22 +186,12 @@ extension HLSVideoEngine {
         let span = "\(packets) packets, \(heldBytes >> 10) KiB, \(String(format: "%.0f", ms)) ms"
         switch verdict {
         case true?:
-            audioStream.pointee.codecpar.pointee.profile = AV_PROFILE_TRUEHD_ATMOS
-            EngineLog.emit(
-                "[HLSVideoEngine] TrueHD profile was not probed; major sync says Atmos (\(span))",
-                category: .session
-            )
+            return (true, "TrueHD profile was not probed; major sync says Atmos (\(span))")
         case false?:
-            EngineLog.emit(
-                "[HLSVideoEngine] TrueHD profile was not probed; major sync says no Atmos (\(span))",
-                category: .session
-            )
+            return (false, "TrueHD profile was not probed; major sync says no Atmos (\(span))")
         case nil:
-            EngineLog.emit(
-                "[HLSVideoEngine] TrueHD profile was not probed and no major sync within the budget (\(span)); "
-                + "treating it as without Atmos",
-                category: .session
-            )
+            return (nil, "TrueHD profile was not probed and no major sync within the budget (\(span)); "
+                + "treating it as without Atmos")
         }
     }
 
@@ -239,7 +246,7 @@ extension HLSVideoEngine {
                     category: .session
                 )
             } else if par.codec_id == AV_CODEC_ID_DTS, objectAudioRendering != .off {
-                // Lossy DTS has no DTS:X to render; only the lossless profiles are offered to LibDTSX.
+                // Lossy DTS has no DTS:X to render; only the lossless profiles reach the DTS:X decoder.
                 EngineLog.emit(
                     "[HLSVideoEngine] object rendering requested but DTS is not 48 kHz DTS-HD Master Audio "
                     + "(profile=\(par.profile) rate=\(par.sample_rate)); keeping the channel bridge",
@@ -292,7 +299,7 @@ extension HLSVideoEngine {
             switch source {
             case .trueHDAtmos:
                 #if TrueHDObjectAudio
-                decoder = try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn)
+                decoder = try TrueHDObjectAudioDecoder()
                 #else
                 return nil
                 #endif
@@ -300,7 +307,7 @@ extension HLSVideoEngine {
                 #if DTSXObjectAudio
                 let dtsx = try DTSXObjectAudioDecoder()
                 // On a resume the verdict reads where the first producer starts, not the file head
-                // that step 8's seek would then drop; LibDTSX decides mid-stream as well.
+                // that step 8's seek would then drop; the decoder decides mid-stream as well.
                 if audioDemuxer === demuxer {
                     seekToInitialProducerStart(audioDemuxer)
                     demuxerAtInitialProducerStart = true
@@ -311,7 +318,7 @@ extension HLSVideoEngine {
                 switch verdict {
                 case .renders(let presentation):
                     EngineLog.emit(
-                        "[HLSVideoEngine] DTS-HD MA track is DTS:X \(presentation) (LibDTSX, "
+                        "[HLSVideoEngine] DTS-HD MA track is DTS:X \(presentation) (first frame, "
                         + "\(String(format: "%.0f", ms)) ms)",
                         category: .session
                     )
@@ -321,7 +328,7 @@ extension HLSVideoEngine {
                     audioIsConfirmedDTSX = true
                 case .refused(let reason):
                     EngineLog.emit(
-                        "[HLSVideoEngine] DTS-HD MA track is not DTS:X LibDTSX renders (\(reason)); "
+                        "[HLSVideoEngine] DTS-HD MA track is not DTS:X this engine renders (\(reason)); "
                         + "keeping the channel bridge",
                         category: .session
                     )
@@ -339,7 +346,8 @@ extension HLSVideoEngine {
                 #endif
             }
             bridge = try SpatialAudioBridge(
-                srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder)
+                srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder,
+                format: objectAudioRendering.bedFormat(routeFormat: SpatialBedFormat.forCurrentRoute()) ?? .apac)
         } catch {
             EngineLog.emit(
                 "[HLSVideoEngine] ERROR: \(source.name) rendering unavailable (\(error)); keeping the channel bridge",
@@ -373,28 +381,28 @@ extension HLSVideoEngine {
             let producer = try makeProducer(baseIndex: initialProducerBaseIndex)
             audioHLSCodecs = bridge.hlsCodecs
             // Short on purpose: hosts append it to a track title in one-line stats rows.
+            let bed = "\(bridge.format == .lpcm ? "PCM" : "APAC") \(layout.rawValue)"
             audioPipelineDescription = source == .trueHDAtmos
-                ? "\(sourceCodecLabel) Atmos → APAC \(layout.rawValue)"
-                : "DTS:X → APAC \(layout.rawValue)"
+                ? "\(sourceCodecLabel) Atmos → \(bed)"
+                : "DTS:X → \(bed)"
             audioDelivery = .bridged
-            audioIsAPAC = true
+            audioIsRenderedBed = true
             let rendering: String
             switch source {
-            case .trueHDAtmos where TrueHDReferenceRender.isOn:
-                rendering = "objects rendered into \(layout.rawValue) (reference render, \(TrueHDReferenceRender.variable))"
             case .trueHDAtmos:
-                rendering = "channel presentation split into \(layout.rawValue) by the objects' energy"
+                rendering = "the stream's channel presentation regressed onto \(layout.rawValue) by its objects"
             case .dtsHDMasterAudio:
                 rendering = "bed and heights routed one to one into \(layout.rawValue)"
             }
             EngineLog.emit(
-                "[HLSVideoEngine] \(source.name): \(rendering), delivered as \(bridge.hlsCodecs) (lossy)",
+                "[HLSVideoEngine] \(source.name): \(rendering), delivered as \(bridge.hlsCodecs) "
+                + "(\(bridge.format == .lpcm ? "lossless 24-bit PCM" : "lossy"))",
                 category: .session
             )
             return producer
         } catch {
             EngineLog.emit(
-                "[HLSVideoEngine] APAC producer header write failed (\(error)); keeping the channel bridge",
+                "[HLSVideoEngine] \(bridge.format == .lpcm ? "PCM" : "APAC") producer header write failed (\(error)); keeping the channel bridge",
                 category: .session
             )
             savedAudioConfig = nil

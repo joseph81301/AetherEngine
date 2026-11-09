@@ -10,6 +10,14 @@ import Foundation
 // across the producer/provider threads and capture in @Sendable closures.
 final class SegmentCache: @unchecked Sendable {
 
+    static let defaultBackwardWindow = 20
+
+    struct StaleSweepResult: Sendable, Equatable {
+        let inspectedCount: Int
+        let removedCount: Int
+        let failureCount: Int
+    }
+
     /// AE#412: where a stored segment's first random-access point sits, as an offset from the
     /// segment's ADVERTISED start (its plan boundary). An offset, not an absolute time, so it is
     /// independent of the item / source / display axes and survives an epoch that opened early.
@@ -73,6 +81,17 @@ final class SegmentCache: @unchecked Sendable {
     private var initVersions: [(versionID: Int, fromSegment: Int, data: Data)] = []
 
     private var closed = false
+    /// (index, bytes, parked) of every segment the producer completes, for the provider's
+    /// march-rate estimate. `parked`: the producer waited on backpressure since the store before, so
+    /// the interval measures the consumer, not the link. Guarded by `condition`, called after it is released.
+    private var storeObserver: (@Sendable (Int, Int, Bool) -> Void)?
+    /// Set by a backpressure or disk-headroom park, cleared by the next store. Guarded by `condition`.
+    private var _parkedSinceStore = false
+    private var _producerParked = false
+    private var _evictionCount = 0
+    private var _lastFailure: SessionCacheFailureReason?
+    private var _lastCleanupReason: SessionCacheCleanupReason?
+    private var _lastCleanupResult: SessionCacheCleanupResult = .notRun
     /// Declared by provider at top of each mediaSegment(at:); non-monotonic (backward scrub is valid).
     private var currentTargetIndex: Int = -1
 
@@ -153,8 +172,16 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
-    init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
-         baseDirectory: URL? = nil, nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
+    init(
+        forwardWindow: Int = 10,
+        backwardWindow: Int = SegmentCache.defaultBackwardWindow,
+        retentionBudgetBytes: Int = 0,
+        baseDirectory: URL? = nil,
+        sessionID: String = UUID().uuidString,
+        now: Date = Date(),
+        nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil,
+        onResidentSetChanged: (@Sendable () -> Void)? = nil
+    ) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
@@ -164,24 +191,31 @@ final class SegmentCache: @unchecked Sendable {
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
         let baseDir = baseDirectory ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("aether-segments", isDirectory: true)
-        let sessionID = UUID().uuidString
         self.sessionDir = baseDir.appendingPathComponent(sessionID, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: sessionDir,
                                                     withIntermediateDirectories: true,
                                                     attributes: nil)
         } catch {
+            _lastFailure = .sessionDirectoryCreationFailed
             EngineLog.emit("[SegmentCache] session dir create failed at \(sessionDir.path): \(error)",
                            category: .session)
             if Self.isOutOfSpace(error) { storageExhaustedLatch = true }
         }
 
         // Before the sweep, so a sibling constructed in the same breath cannot read this session
-        // as unheld. The age check covers the remaining microseconds: a directory this young is
-        // never a sweep candidate.
+        // as unheld (AE#451). The age check covers the remaining microseconds: a directory this
+        // young is never a sweep candidate.
         self.lockFD = Self.acquireLiveMarker(sessionDir: sessionDir)
-
-        Self.sweepStaleSessionDirs(baseDir: baseDir, currentSession: sessionID)
+        let sweep = Self.sweepStaleSessionDirs(baseDir: baseDir, currentSession: sessionID, now: now)
+        if sweep.failureCount > 0 {
+            _lastFailure = .staleSweepFailed
+            EngineLog.emit(
+                "[SegmentCache] bounded stale sweep: inspected=\(sweep.inspectedCount) "
+                + "removed=\(sweep.removedCount) failures=\(sweep.failureCount)",
+                category: .session
+            )
+        }
     }
 
     deinit {
@@ -201,25 +235,56 @@ final class SegmentCache: @unchecked Sendable {
         if fd >= 0 { Darwin.close(fd) }
     }
 
-    private static func sweepStaleSessionDirs(baseDir: URL, currentSession: String) {
+    /// Bounded crash-remnant cleanup. Only expired sibling directories are eligible; the current
+    /// UUID and fresh sessions are never removed. Preserve upstream creation-time age and held-lock
+    /// liveness checks. Both directory inspection and deletion are capped
+    /// so a cache root with many crash remnants cannot create an unbounded startup I/O burst.
+    static func sweepStaleSessionDirs(
+        baseDir: URL,
+        currentSession: String,
+        now: Date = Date(),
+        maxEntries: Int = 128,
+        maxRemovals: Int = 16
+    ) -> StaleSweepResult {
         let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(at: baseDir,
-                                                        includingPropertiesForKeys: [.creationDateKey],
-                                                        options: [.skipsHiddenFiles]) else {
-            return
+        guard maxEntries > 0, maxRemovals > 0 else {
+            return StaleSweepResult(inspectedCount: 0, removedCount: 0, failureCount: 0)
         }
-        let cutoff = Date().addingTimeInterval(-3600)
-        for entry in entries where entry.lastPathComponent != currentSession {
-            let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
-            guard created == nil || created! < cutoff else { continue }
-            // AE#451: age says how long it has been there, not whether anyone is still using it.
+        var failures = 0
+        guard let enumerator = fm.enumerator(
+            at: baseDir,
+            includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+            errorHandler: { _, _ in failures += 1; return false }
+        ) else {
+            return StaleSweepResult(inspectedCount: 0, removedCount: 0, failureCount: max(1, failures))
+        }
+
+        let cutoff = now.addingTimeInterval(-3600)
+        var inspected = 0
+        var removed = 0
+        while inspected < maxEntries, let entry = enumerator.nextObject() as? URL {
+            inspected += 1
+            guard entry.lastPathComponent != currentSession, removed < maxRemovals else { continue }
+            let values: URLResourceValues
+            do { values = try entry.resourceValues(forKeys: [.isDirectoryKey, .creationDateKey]) }
+            catch { failures += 1; continue }
+            // An unreadable creation date counts as old, as before; liveness still spares a held one.
+            guard values.isDirectory == true, (values.creationDate.map { $0 < cutoff } ?? true) else { continue }
+            // Old does not mean abandoned: spare sessions whose marker is held (AE#451).
             if SessionDirectoryLiveness.isLive(entry) {
                 EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
                                category: .session)
                 continue
             }
-            try? fm.removeItem(at: entry)
+            do {
+                try fm.removeItem(at: entry)
+                removed += 1
+            } catch {
+                failures += 1
+            }
         }
+        return StaleSweepResult(inspectedCount: inspected, removedCount: removed, failureCount: failures)
     }
 
     // MARK: - Writer side
@@ -291,7 +356,8 @@ final class SegmentCache: @unchecked Sendable {
         return true
     }
 
-    func store(index: Int, data: Data) {
+    @discardableResult
+    func store(index: Int, data: Data) -> Bool {
         let fileURL = nextSegmentFileURL(index: index)
         var writeOK: Bool
         do {
@@ -314,17 +380,19 @@ final class SegmentCache: @unchecked Sendable {
                                category: .session)
                 if Self.isOutOfSpace(finalError) { noteStorageExhausted() }
                 writeOK = false
+                condition.lock()
+                _lastFailure = .writeFailed
+                condition.unlock()
             } else {
                 writeOK = true
             }
         }
-
         condition.lock()
         // store racing close() must not resurrect bookkeeping; entry would point into deleted sessionDir.
         guard !closed else {
             condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
-            return
+            return false
         }
         // A re-store of a resident index changes bytes, not residency; only an insertion or an
         // eviction moves the set, and both are already known here without walking it.
@@ -343,18 +411,24 @@ final class SegmentCache: @unchecked Sendable {
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
+        let observer = storeObserver
+        let parked = _parkedSinceStore
+        _parkedSinceStore = false
         condition.broadcast()
         condition.unlock()
         if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
         for url in doomed { try? FileManager.default.removeItem(at: url) }
         if residentSetChanged { onResidentSetChanged?() }
+        if writeOK { observer?(index, data.count, parked) }
+        return writeOK
     }
 
     /// Adopt a staging file via rename(2). Page cache pages stay warm; skips a Swift Data round trip.
     ///
     /// `videoReach` (AE#412) is what this segment's video offers a cold arrival; nil leaves the
     /// previous claim in place only if the index is re-adopted without one, which no caller does.
-    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) {
+    @discardableResult
+    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) -> Bool {
         let fileURL = nextSegmentFileURL(index: index)
         var renameOK: Bool
         do {
@@ -369,9 +443,11 @@ final class SegmentCache: @unchecked Sendable {
                                category: .session)
                 try? FileManager.default.removeItem(at: stagingPath)
                 renameOK = false
+                condition.lock()
+                _lastFailure = .adoptFailed
+                condition.unlock()
             }
         }
-
         condition.lock()
         // Sealed or not, this staging file is no longer being written.
         if inProgress[index] == stagingPath { inProgress.removeValue(forKey: index) }
@@ -387,7 +463,7 @@ final class SegmentCache: @unchecked Sendable {
             condition.broadcast()
             condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
-            return
+            return false
         }
         var residentSetChanged = false
         var supersededFile: URL?
@@ -410,16 +486,28 @@ final class SegmentCache: @unchecked Sendable {
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
+        let observer = storeObserver
+        let parked = _parkedSinceStore
+        _parkedSinceStore = false
         condition.broadcast()
         condition.unlock()
         if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
         for url in doomed { try? FileManager.default.removeItem(at: url) }
         if residentSetChanged { onResidentSetChanged?() }
+        if renameOK { observer?(index, byteCount, parked) }
+        return renameOK
     }
 
-    func close() {
+    @discardableResult
+    func close(reason: SessionCacheCleanupReason = .sessionStopped) -> SessionCacheCleanupResult {
         condition.lock()
+        if closed {
+            let prior = _lastCleanupResult
+            condition.unlock()
+            return prior
+        }
         closed = true
+        _lastCleanupReason = reason
         let expiryTimer = nativeLiveExpiryTimer
         nativeLiveExpiryTimer = nil
         let dir = sessionDir
@@ -434,15 +522,29 @@ final class SegmentCache: @unchecked Sendable {
         sealedStagingOrder.removeAll(keepingCapacity: false)
         _totalBytes = 0
         _highestStoredIndex = -1
+        _producerParked = false
+        _parkedSinceStore = false
         condition.broadcast()
         condition.unlock()
 
         expiryTimer?.cancel()
         releaseLiveMarker()
-        try? FileManager.default.removeItem(at: dir)
-        // A closed cache holds nothing, and that is a resident-set change like any other. The engine
-        // clears its published band on teardown anyway; this keeps the cache honest on its own.
+        let result: SessionCacheCleanupResult
+        do {
+            if FileManager.default.fileExists(atPath: dir.path) {
+                try FileManager.default.removeItem(at: dir)
+            }
+            result = .succeeded
+        } catch {
+            result = .failed
+            EngineLog.emit("[SegmentCache] session cleanup failed: \(error)", category: .session)
+        }
+        condition.lock()
+        _lastCleanupResult = result
+        if result == .failed { _lastFailure = .cleanupFailed }
+        condition.unlock()
         if hadEntries { onResidentSetChanged?() }
+        return result
     }
 
     // MARK: - Reader side
@@ -586,8 +688,10 @@ final class SegmentCache: @unchecked Sendable {
 
     /// `fetch` for the loopback server. With `progressive`, a segment that is being written is
     /// answered at once with a reader over its staging file, so AVPlayer receives each fragment as
-    /// the muxer flushes it instead of the whole segment after its cut.
-    func fetchSource(index: Int, timeout: TimeInterval, progressive: Bool) -> SegmentSource? {
+    /// the muxer flushes it instead of the whole segment after its cut. With `whileTarget`, the wait
+    /// also ends as soon as the declared target is no longer `index`.
+    func fetchSource(index: Int, timeout: TimeInterval, progressive: Bool,
+                     whileTarget: Bool = false) -> SegmentSource? {
         let deadline = Date().addingTimeInterval(timeout)
         condition.lock()
         while true {
@@ -595,7 +699,7 @@ final class SegmentCache: @unchecked Sendable {
                 condition.unlock()
                 return readOrDrop(index: index, url: url).map { .data($0) }
             }
-            if closed {
+            if closed || (whileTarget && currentTargetIndex != index) {
                 condition.unlock()
                 return nil
             }
@@ -646,6 +750,7 @@ final class SegmentCache: @unchecked Sendable {
         defer { condition.unlock() }
         if currentTargetIndex >= target { return true }
         if closed { return false }
+        _parkedSinceStore = true
         let deadline = Date().addingTimeInterval(timeout)
         _ = condition.wait(until: deadline)
         return currentTargetIndex >= target
@@ -663,6 +768,7 @@ final class SegmentCache: @unchecked Sendable {
             entries.removeValue(forKey: k)
             doomed.append(url)
         }
+        _evictionCount += doomed.count
         condition.unlock()
         for url in doomed {
             try? FileManager.default.removeItem(at: url)
@@ -694,6 +800,61 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return currentTargetIndex
+    }
+
+    var producerParked: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return _producerParked
+    }
+
+    var lastCleanupReason: SessionCacheCleanupReason? {
+        condition.lock()
+        defer { condition.unlock() }
+        return _lastCleanupReason
+    }
+
+    var lastFailure: SessionCacheFailureReason? {
+        condition.lock()
+        defer { condition.unlock() }
+        return _lastFailure
+    }
+
+    func status(
+        route: SessionCacheRoute,
+        requestedBudgetBytes: Int?,
+        baseEffectiveBudgetBytes: Int,
+        volumeSafetyLimitBytes: Int?,
+        capability: SessionCacheCapability = .active
+    ) -> SessionCacheStatus {
+        condition.lock()
+        defer { condition.unlock() }
+        let lo = currentTargetIndex - backwardWindow
+        let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
+        var hardFloor = 0
+        for (index, bytes) in entryBytes where index >= lo && index <= hi {
+            hardFloor += bytes
+        }
+        let effective = max(baseEffectiveBudgetBytes, hardFloor)
+        return SessionCacheStatus(
+            route: route,
+            capability: closed ? .inactive : capability,
+            requestedBudgetBytes: requestedBudgetBytes,
+            volumeSafetyLimitBytes: volumeSafetyLimitBytes,
+            baseEffectiveBudgetBytes: baseEffectiveBudgetBytes,
+            playbackSafeFloorBytes: hardFloor,
+            effectiveBudgetBytes: effective,
+            currentResidentBytes: _totalBytes,
+            currentForwardBytes: currentForwardBytes(),
+            forwardWindowSegments: forwardWindow,
+            backwardWindowSegments: backwardWindow,
+            producerParked: _producerParked,
+            evictionCount: _evictionCount,
+            hardWindowFloorExceeded: hardFloor > baseEffectiveBudgetBytes,
+            cleanupReason: _lastCleanupReason,
+            cleanupResult: _lastCleanupResult,
+            lastFailure: _lastFailure
+        )
     }
 
     /// How often a pump has passed a plan index without opening a segment for it (#358).
@@ -849,6 +1010,21 @@ final class SegmentCache: @unchecked Sendable {
         return entries.keys.max()
     }
 
+    /// See `storeObserver`.
+    func setStoreObserver(_ observer: (@Sendable (Int, Int, Bool) -> Void)?) {
+        condition.lock()
+        storeObserver = observer
+        condition.unlock()
+    }
+
+    /// True when the producer parked on backpressure after its last store: the time since that store
+    /// was spent waiting for the consumer, not writing.
+    var parkedSinceLastStore: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return _parkedSinceStore
+    }
+
     /// Reset before triggering a restart; previous producer's highWater would keep producerPassedAndPruned
     /// hot on every fetch, cascading a single restart into a per-segment storm.
     func resetHighWaterForRestart() {
@@ -895,9 +1071,16 @@ final class SegmentCache: @unchecked Sendable {
     func awaitPrefetchDiskHeadroom(head: Int, budgetBytes: Int, timeout: TimeInterval = 1.0) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        if !shouldParkLocked(head: head, budgetBytes: budgetBytes) { return true }
+        if !shouldParkLocked(head: head, budgetBytes: budgetBytes) {
+            _producerParked = false
+            return true
+        }
+        _producerParked = true
+        _parkedSinceStore = true
         _ = condition.wait(until: Date().addingTimeInterval(timeout))
-        return !shouldParkLocked(head: head, budgetBytes: budgetBytes)
+        let released = !shouldParkLocked(head: head, budgetBytes: budgetBytes)
+        _producerParked = !released
+        return released
     }
 
     /// Must be called with condition held.
@@ -1030,6 +1213,7 @@ final class SegmentCache: @unchecked Sendable {
                     doomed.append(url)
                 }
             }
+            _evictionCount += doomed.count
             return doomed
         }
         for (k, url) in entries {
@@ -1041,6 +1225,7 @@ final class SegmentCache: @unchecked Sendable {
                 doomed.append(url)
             }
         }
+        _evictionCount += doomed.count
         // Collected under the lock, deleted by the caller AFTER
         // unlocking: removeItem is filesystem I/O on the segment-serve
         // hot path (fetch waiters + the pump's backpressure wait park on
