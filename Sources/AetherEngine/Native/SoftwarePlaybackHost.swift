@@ -410,6 +410,25 @@ final class SoftwarePlaybackHost {
     }
     nonisolated(unsafe) private var _pausedBeforeFirstFrame = false
 
+    /// A seek that landed paused still owes the picture at its target: the loops keep reading under the
+    /// pause until the first frame of that seek's generation is in, as they do for a session's first
+    /// frame (`PausedFirstFrame`). Without it the loops stood still from the landing to the next `play()`
+    /// and the frame from before the seek stayed on screen. Set by a paused landing; cleared by that
+    /// frame, `play()`, `stop()` and the next seek.
+    nonisolated private var pausedSeekFrameGeneration: UInt64? {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _pausedSeekFrameGeneration }
+        set { flagsLock.lock(); _pausedSeekFrameGeneration = newValue; flagsLock.unlock() }
+    }
+    nonisolated(unsafe) private var _pausedSeekFrameGeneration: UInt64?
+
+    /// Clears the paused seek's hold and says whether this frame's generation owned it, in one step.
+    nonisolated private func takePausedSeekFrame(generation: UInt64) -> Bool {
+        flagsLock.lock(); defer { flagsLock.unlock() }
+        guard _pausedSeekFrameGeneration == generation else { return false }
+        _pausedSeekFrameGeneration = nil
+        return true
+    }
+
     /// Clears the flag and says whether it was set, in one step, so the first frame and a `play()` cannot
     /// both act on it.
     nonisolated private func takePausedBeforeFirstFrame() -> Bool {
@@ -1453,6 +1472,14 @@ final class SoftwarePlaybackHost {
             guard self.decodeGeneration == self.seekGeneration else { return }
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             self.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
+            // A seek that landed paused: this is the picture at its target (the skip threshold let
+            // nothing earlier through). Out of the reorder buffer, the stopped clock onto it, and the
+            // loops park again.
+            if self.takePausedSeekFrame(generation: self.decodeGeneration) {
+                self.renderer.drainReorderBuffer()
+                self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration,
+                                                 reason: "paused seek")
+            }
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
             if self.bumpFramesEnqueued() == 0 {
                 self.noteFirstFrameEnqueuedForDisplayFallback()
@@ -1784,6 +1811,7 @@ final class SoftwarePlaybackHost {
         case .resumeHostPause:
             pausedByHost = false
             _ = takePausedBeforeFirstFrame()
+            pausedSeekFrameGeneration = nil
             if clockArmed {
                 audioOutput?.setRate(lastRate)
             }
@@ -1943,7 +1971,8 @@ final class SoftwarePlaybackHost {
     /// Sodalite#104 round 4: the first frame of a session paused before it is in. Moves the stopped clock
     /// onto it where it stands before the frame (`PausedFirstFrame.presentationAnchor`). On the main actor,
     /// so a `play()` either runs first and finds the flag gone, or runs after and restarts this clock.
-    nonisolated private func presentFirstFrameUnderPause(pts: Double, generation: UInt64) {
+    nonisolated private func presentFirstFrameUnderPause(pts: Double, generation: UInt64,
+                                                         reason: String = "#104 first frame") {
         Task { @MainActor [weak self] in
             guard let self, !self.stopRequested, !self.isPlaying, self.pausedByHost,
                   generation == self.seekGeneration, let aOut = self.audioOutput else { return }
@@ -1954,7 +1983,7 @@ final class SoftwarePlaybackHost {
                 aOut.seekClock(to: CMTime(seconds: anchor, preferredTimescale: 90000), rate: 0)
             }
             EngineLog.emit(
-                "[SWHost] #104 first frame in under the pause: pts=\(String(format: "%.3f", pts))s "
+                "[SWHost] \(reason) in under the pause: pts=\(String(format: "%.3f", pts))s "
                 + "clock=\(String(format: "%.3f", clock))s"
                 + (anchor != nil ? ", stopped clock moved onto the frame" : ", presented where the clock stands"),
                 category: .swPlayback
@@ -2439,6 +2468,7 @@ final class SoftwarePlaybackHost {
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
+        pausedSeekFrameGeneration = nil
         residentRangePublication.invalidate()
         didReachEnd = false
         didParkClockAtEnd = false
@@ -2603,6 +2633,9 @@ final class SoftwarePlaybackHost {
             // Paused seek: anchor at target with rate 0 so play() resumes from the seek position (without this, scrubs freeze or drop all samples).
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
+            // The picture at the target is still owed: the loops run until it is in (released by
+            // `noteSeekSettled` below, which opens the loop's park).
+            pausedSeekFrameGeneration = generation
         }
         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
         clockArmed = true
@@ -2859,6 +2892,7 @@ final class SoftwarePlaybackHost {
     func stop() {
         stopRequested = true
         pausedBeforeFirstFrame = false
+        pausedSeekFrameGeneration = nil
         isPlaying = false
         isRebuffering = false
         seekInFlight = false
@@ -2971,7 +3005,8 @@ final class SoftwarePlaybackHost {
         let getIsPlaying: @Sendable () -> Bool = { [weak self] in
             guard let self else { return false }
             return PausedFirstFrame.loopsMayRun(isPlaying: self.isPlaying,
-                                                pausedBeforeFirstFrame: self.pausedBeforeFirstFrame)
+                                                pausedBeforeFirstFrame: self.pausedBeforeFirstFrame
+                                                    || self.pausedSeekFrameGeneration != nil)
         }
         let getStopRequested: @Sendable () -> Bool = { [weak self] in self?.stopRequested ?? true }
         // #95: resolved per packet so a tap installed mid-session is picked up by running loops.

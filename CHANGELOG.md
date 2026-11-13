@@ -12,6 +12,16 @@ the public-API contract.
 
 ### Fixed
 
+- **A seek while paused on the software path shows the picture at its target.** The demux loop
+  reads only while playing (`SeekWindow.loopMayRead`), and the hold that keeps it reading under a
+  pause covered only a session's first frame (Sodalite#104), so a paused landing decoded nothing:
+  the clock and the seek bar moved to the target and the frame from before the seek stayed on
+  screen until `play()`, for a seek into retained packets and a miss alike. A paused landing now
+  holds the loops open for its own generation's first frame, drains it out of the reorder buffer
+  and presents it at the stopped clock, then the loops park again. Measured with `aetherctl play
+  --sw` while paused: the target frame in 47 ms on a cache hit, 58 ms on a parked run, 475 ms on a
+  miss, where none arrived before `play()`.
+
 - **On the software path, jumping back to video already played no longer fetches it again after a
   seek elsewhere.** The packet store held one run of the source, and a seek outside it discarded the
   run, so "jump ahead, then back" always went to the network (an Apple TV decoding 4K AV1 on the CPU
