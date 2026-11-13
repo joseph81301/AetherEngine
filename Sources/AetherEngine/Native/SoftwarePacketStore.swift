@@ -16,10 +16,15 @@ protocol SoftwarePacketStore: AnyObject, Sendable {
     func close() throws
     /// Drops history the system reclaimed behind the store's back. Returns whether anything went.
     func evictPurgedHistory() -> Bool
+    /// The read-ahead stopped reading this store to play another stretch of the source, and keeps
+    /// it for a later seek back into it (`restore`). A store whose unread records cost memory makes
+    /// them reclaimable here; the disk store has nothing to give back.
+    func park()
 }
 
 extension SoftwarePacketStore {
     func evictPurgedHistory() -> Bool { false }
+    func park() {}
 }
 
 extension SoftwarePacketDiskFIFO: SoftwarePacketStore {}

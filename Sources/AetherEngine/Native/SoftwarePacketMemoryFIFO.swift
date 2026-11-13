@@ -85,7 +85,7 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
     }
 
     private let chunkTargetBytes: Int
-    private let historyCapBytes: Int
+    let historyCapBytes: Int
     private let kernelMayPurge: Bool
     var retainsConsumedPackets: Bool { historyCapBytes > 0 }
     private let lock = NSLock()
@@ -103,6 +103,9 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
     private var failure: (any Error)?
     /// History chunks found emptied by the kernel. Diagnostics and tests.
     private(set) var purgedChunks = 0
+    /// Set by `park()`: the reader stands at the end and every chunk, unread ones included, is
+    /// volatile. The next `restore` makes the chunks it hands back non-volatile through the tail.
+    private var isParked = false
 
     /// `kernelMayPurge: false` keeps history resident at the kernel level while every count and
     /// state transition still treats it as volatile, so only `purgeHistoryForTesting` empties it.
@@ -203,7 +206,17 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
         guard Int(cursor.offset) + 8 <= (try chunkLocked(cursor.chunkID)).used else {
             throw SoftwarePacketDiskFIFO.Failure.invalidCursor
         }
-        if cursor.chunkID < headID {
+        if isParked {
+            // Everything is volatile while parked, the chunks past the old reader too: all of them
+            // from the cursor on become unread again. A refused cursor leaves the store parked.
+            do {
+                try reclaimLocked(from: cursor.chunkID, through: tailIDLocked)
+            } catch {
+                for chunk in chunks { chunk.setVolatile(true) }
+                throw error
+            }
+            isParked = false
+        } else if cursor.chunkID < headID {
             try reclaimLocked(from: cursor.chunkID, through: headID - 1)
         } else {
             // Forward within stored data: what the reader skips becomes history.
@@ -283,6 +296,21 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
             oldestChunkID = oldest.id + 1
             history -= oldest.used
         }
+    }
+
+    /// The read-ahead parked this run to play another stretch of the source (a seek outside it).
+    /// Every record, unread ones included, becomes history: all chunks turn volatile, so a parked
+    /// run costs no footprint and the kernel may take it back under memory pressure. `restore` to
+    /// one of its cursors brings it back; one the kernel emptied refuses the cursor (a miss).
+    func park() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed, failure == nil else { return }
+        for chunk in chunks { chunk.setVolatile(true) }
+        if let tail = chunks.last { headID = tail.id; headOffset = tail.used }
+        recordCount = 0
+        payloadBytes = 0
+        isParked = true
     }
 
     /// Evicts history the kernel has emptied, up to the newest emptied chunk. Without it the store
@@ -378,6 +406,7 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
     }
 
     private func clearLocked() {
+        isParked = false
         chunks.removeAll()
         generation = UUID()
         oldestChunkID = 0

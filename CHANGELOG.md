@@ -12,6 +12,18 @@ the public-API contract.
 
 ### Fixed
 
+- **On the software path, jumping back to video already played no longer fetches it again after a
+  seek elsewhere.** The packet store held one run of the source, and a seek outside it discarded the
+  run, so "jump ahead, then back" always went to the network (an Apple TV decoding 4K AV1 on the CPU
+  waited 2.5 s for every such jump). A miss now parks the run instead (up to two parked runs; on
+  tvOS a parked run is volatile memory, so it costs no footprint and one the kernel reclaimed is an
+  ordinary miss; on disk parked runs take at most half the session budget). A seek into a parked run
+  plays from it at once while the source moves to that run's last keyframe behind the picture, and
+  the packets the run already holds are dropped as they arrive again. Measured with `aetherctl play
+  --sw` on a 3 Mbps H.264 Matroska source capped at 960 KB/s, memory store: back into a run left by
+  a forward jump went from 5.0 to 5.6 s to 0.08 to 0.12 s to the first frame, forward into the run
+  just left from 0.4 to 1.5 s to about 0.1 s; a jump to a stretch no run holds is unchanged.
+
 - **AirPlay video from a Mac reaches the receiver.** A Mac that sent a native-route session to an Apple
   TV or an AirPlay TV handed the receiver the engine's 127.0.0.1 playlist, which it cannot reach, so the
   TV never started. The LAN-address rewrite that iOS has done since #86 now applies on macOS too.

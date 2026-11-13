@@ -348,9 +348,22 @@ for available preroll, and keeps the producer at its existing source frontier.
 AV1 through dav1d restores to the last keyframe at or before the target instead
 (`anchorsOnLastKeyframe`): an AV1 keyframe opens on its own, and the earlier one
 only cost dav1d a whole GOP of decode before the picture came back.
-A cache miss clears coverage and repositions the demuxer; discarding the spool
-is the worker's job, not the seek's, because removing every retained chunk costs
-more the longer the session has kept them and no seek waits on that work.
+A cache miss repositions the demuxer and starts a new run in an empty store; the
+run being left is parked, not discarded (`SoftwarePacketReadAhead.parked`, at
+most `maximumParkedRuns`, two): its store with the coverage, keyframes and
+residency that find a target in it. A memory store parks by turning every chunk
+volatile, unread ones too, so a parked run costs no footprint and one the kernel
+reclaimed refuses its cursor (a miss); on disk, parked runs take at most half of
+the session budget and the active run trims to what is left. A seek first looks
+in the active run, then in the parked ones: a parked hit swaps that run in, the
+consumer plays from its keyframe at once, and the host moves the source to the
+run's last keyframe behind the landing (`finishSourceReposition`). Until then the
+producer stays parked; after it, packets up to the run's newest stored one (by
+file position, else decode time, else presentation time, per stream) are
+dropped as duplicates. Without a store factory (live, forward-only, external
+cache timing) a miss discards the run as before, and discarding the spool is the
+worker's job, not the seek's, because removing every retained chunk costs more
+the longer the session has kept them and no seek waits on that work.
 Consumer generations
 and source epochs are separate: a cached seek must not discard an in-flight
 producer packet, and a superseded consumer must not steal the first packet of a

@@ -47,13 +47,74 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         case interrupted, closed, corruptFIFO
         /// The optional wait expired without consuming a packet; the source is still open.
         case idle
+        /// The source could not be moved to the end of a resumed parked run: that run plays what it
+        /// holds, then reads end with this.
+        case sourceRepositionFailed
     }
 
     private let condition = NSCondition()
     /// Never acquired by a main-thread API. Serializes reset with append/pop, including the
     /// generation check, so an old consumer cannot pop and discard the first NEW-generation packet.
     private let operations = NSLock()
-    private let fifo: any SoftwarePacketStore
+    /// The run being played: the stretch of the source the consumer reads and the producer extends.
+    /// Swapped only with `operations` and `condition` both held, so either lock gives a stable read.
+    private var fifo: any SoftwarePacketStore
+    /// Makes an empty store for a new run. With one, a seek outside the run parks the run instead of
+    /// discarding it (`parked`), and a later seek back into it plays from it again. nil keeps the
+    /// one-run behaviour: a miss resets the store.
+    private let makeStore: (@Sendable () throws -> any SoftwarePacketStore)?
+    /// A run the consumer left for a seek outside it: its store and the metadata that finds a seek
+    /// target in it, frozen as they were when it was parked. Newest last.
+    private struct Span {
+        let store: any SoftwarePacketStore
+        var keyframes: [Keyframe]
+        var videoCoverage: SoftwarePacketCoverage
+        var audioCoverage: SoftwareAudioPacketCoverage
+        var presentationCoverage: SoftwareVideoPacketCoverage?
+        var residency: SoftwarePacketResidency
+        var storedVideoSeconds: Double?
+        var ended: Bool
+        var tail: StoredTail
+        /// What the store still holds against the session's byte budget (a parked memory store
+        /// holds only volatile chunks, so nothing).
+        var residentBytes: Int
+    }
+    /// The newest packet the producer stored per stream in the active run: where a source that was
+    /// repositioned to a parked run's end must start appending again, and what before it is a
+    /// duplicate of what the run already holds.
+    struct StoredTail: Sendable, Equatable {
+        struct Mark: Sendable, Equatable {
+            var position: Int64
+            var dts: Int64
+            var pts: Int64
+        }
+        var video: Mark?
+        var audio: Mark?
+
+        /// Whether `packet` is one the run already holds: at or before the newest stored packet of
+        /// its stream, by file position where both have one, else by decode then presentation
+        /// time. Per stream, because a container's interleave need not keep positions in order
+        /// across streams, and by decode order, because a reordered picture after the newest
+        /// stored one can carry an earlier presentation time and still be new.
+        static func isDuplicate(position: Int64, dts: Int64, pts: Int64, of mark: Mark) -> Bool {
+            if position >= 0, mark.position >= 0 { return position <= mark.position }
+            if dts != Int64.min, mark.dts != Int64.min { return dts <= mark.dts }
+            if pts != Int64.min, mark.pts != Int64.min { return pts <= mark.pts }
+            return false
+        }
+    }
+    private var parked: [Span] = []
+    /// Two parked runs besides the active one: "jump ahead, then back" and one more stretch.
+    static let maximumParkedRuns = 2
+    private var parkedResidentBytes = 0
+    private var storedTail = StoredTail()
+    /// Set while the source is being moved to a resumed parked run's end; packets up to `tail` are
+    /// already in the run and are dropped instead of stored.
+    private var duplicatesBefore: StoredTail?
+    /// The host still has to move the source for this epoch (`finishSourceReposition`). Until then
+    /// the producer stays parked even after the seek itself has ended.
+    private var pendingSourceReposition = false
+    private var parkedRunHits: UInt64 = 0
     private let readSource: @Sendable (@Sendable () -> Bool) throws -> SoftwareStoredPacket?
     private let beforeConsumerOperation: (@Sendable () -> Void)?
     private let video: Stream
@@ -147,6 +208,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
          coverageRangeCap: Int = 4096,
          anchorsOnLastKeyframe: Bool = false,
          forwardOnly: Bool = false,
+         makeStore: (@Sendable () throws -> any SoftwarePacketStore)? = nil,
          beforeConsumerOperation: (@Sendable () -> Void)? = nil,
          readSource: @escaping @Sendable (@Sendable () -> Bool) throws -> SoftwareStoredPacket?) {
         self.cacheTiming = forwardOnly ? nil : cacheTiming
@@ -158,6 +220,9 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         self.forwardSeconds = max(1, forwardSeconds)
         self.sourceClock = initialSourceClock
         self.fifo = fifo
+        // Parking keeps a run's own packet metadata; external cache timing is one ledger per
+        // session, so those sessions keep the one-run behaviour.
+        self.makeStore = forwardOnly || cacheTiming != nil ? nil : makeStore
         self.videoCoverage = SoftwarePacketCoverage(maximumRangeCount: coverageRangeCap)
         self.audioCoverage = SoftwareAudioPacketCoverage(
             timeBaseNumerator: audio?.numerator ?? 1, timeBaseDenominator: audio?.denominator ?? 1,
@@ -192,7 +257,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     var snapshot: Snapshot {
         condition.lock(); defer { condition.unlock() }
         applyCacheTimingLocked()
-        return Snapshot(packetCount: count, bytes: bytes, residentBytes: residentBytes,
+        return Snapshot(packetCount: count, bytes: bytes, residentBytes: residentBytes + parkedResidentBytes,
                         frontier: sourceRepositioning || closed ? nil : frontierLocked(),
                         generation: generation, seeking: seeking, sourceEnded: ended,
                         sourceEpoch: sourceEpoch, cacheSeekHits: cacheSeekHits,
@@ -305,9 +370,32 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         return generation
     }
 
-    /// Off-main, BEFORE any actual demuxer reposition. true means the target is already retained.
-    /// A hit does not change sourceEpoch: an in-flight source read must still be stored afterwards.
+    /// What a seek found (`prepareSeekOutcome`).
+    enum SeekPreparation: Equatable, Sendable {
+        /// The active run holds the target: the consumer replays it, the source reads on.
+        case hit
+        /// A parked run holds the target and is the active run now: the consumer plays from it at
+        /// once. When `resumeSourceAt` is set the host moves the source there (the run's last
+        /// keyframe) and calls `finishSourceReposition`; packets the run already holds are dropped.
+        /// nil: the run reaches the end of the source, nothing more to read.
+        case parkedHit(resumeSourceAt: Double?)
+        /// Nothing retained covers the target: the host repositions the source to it.
+        case miss
+    }
+
+    /// Off-main, BEFORE any actual demuxer reposition. true means the target is already retained
+    /// and the source needs no move (see `prepareSeekOutcome` for the parked-run case).
     func prepareSeek(_ token: UInt64, to seconds: Double) throws -> Bool {
+        switch try prepareSeekOutcome(token, to: seconds) {
+        case .hit: return true
+        case .parkedHit(let resume): return resume == nil
+        case .miss: return false
+        }
+    }
+
+    /// Off-main, BEFORE any actual demuxer reposition. A hit in the active run does not change
+    /// sourceEpoch: an in-flight source read must still be stored afterwards.
+    func prepareSeekOutcome(_ token: UInt64, to seconds: Double) throws -> SeekPreparation {
         operations.lock(); defer { operations.unlock() }
         condition.lock()
         guard token == generation, seeking, !closed else {
@@ -316,12 +404,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         applyCacheTimingLocked()
         let hasCoverage = !sourceRepositioning && !resetPending && retainedPacketsUsableLocked
             && seconds.isFinite && (frontierLocked(at: seconds).map { $0 > seconds } ?? false)
-        let candidates = hasCoverage ? keyframes.filter { $0.seconds <= seconds }
-            .sorted { $0.seconds < $1.seconds } : []
-        // A previous recovery/key picture supplies open-GOP/audio preroll when still retained, except
-        // where a keyframe needs none (`anchorsOnLastKeyframe`).
-        let anchor = candidates.isEmpty ? nil
-            : candidates[max(0, candidates.count - (anchorsOnLastKeyframe ? 1 : 2))]
+        let anchor = hasCoverage ? anchorLocked(in: keyframes, at: seconds) : nil
         condition.unlock()
 
         if let anchor {
@@ -338,7 +421,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                 consumedVideoSeconds = seconds
                 cacheSeekHits &+= 1
                 condition.broadcast()
-                return true
+                return .hit
             } catch SoftwarePacketDiskFIFO.Failure.invalidCursor {
                 // An expired bookmark is a cache miss, never a playback/disk failure.
             } catch SoftwarePacketDiskFIFO.Failure.retentionDisabled {
@@ -346,24 +429,184 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             }
         }
 
+        if let resumed = try resumeParkedRunLocked(token, at: seconds) { return resumed }
+
+        // Made before taking the state lock: a disk store creates its session directory.
+        let replacement = makeStore.flatMap { try? $0() }
         condition.lock()
         guard token == generation, !closed else {
-            condition.unlock(); throw ReadError.interrupted
+            condition.unlock()
+            if let replacement { DispatchQueue.global(qos: .utility).async { try? replacement.close() } }
+            throw ReadError.interrupted
         }
+        // The run being left is kept for a seek back into it, and the new one starts in an empty
+        // store, in place of the discard below.
+        if let replacement { swapActiveRunLocked(to: replacement) }
         sourceEpoch &+= 1
         sourceRepositioning = true
+        pendingSourceReposition = false
+        duplicatesBefore = nil
+        storedTail = StoredTail()
         // Discarding the spool is the WORKER's job, not the seek's. Reset removes every retained
         // chunk one by one, so its cost grows with what the session has kept: measured 4.5 ms at
         // 64 MB, 18.9 ms at 256 MB, 60.9 ms at 512 MB, on a ceiling of 2 GiB. Done inline, a miss
         // got slower the longer the session had been running, for work no seek waits on: the
         // producer parks on `sourceRepositioning` until `endSeek`, and takes the reset first.
-        resetPending = true
+        // With a replacement the old run went whole into `parked` (or was closed), and the new
+        // store starts empty: nothing to reset.
+        resetPending = replacement == nil
         clearSourceMetadataLocked()
         sourceClock = seconds
         cacheSeekMisses &+= 1
         condition.broadcast()
         condition.unlock()
-        return false
+        return .miss
+    }
+
+    /// The keyframe a cached seek to `seconds` restores to: the last retained one at or before it,
+    /// or the one before that, which supplies open-GOP and audio preroll where it is still
+    /// retained, except where a keyframe needs none (`anchorsOnLastKeyframe`).
+    private func anchorLocked(in keyframes: [Keyframe], at seconds: Double) -> Keyframe? {
+        let candidates = keyframes.filter { $0.seconds <= seconds }.sorted { $0.seconds < $1.seconds }
+        return candidates.isEmpty ? nil
+            : candidates[max(0, candidates.count - (anchorsOnLastKeyframe ? 1 : 2))]
+    }
+
+    /// Called with `operations` held and `condition` not. Looks for a parked run that holds
+    /// `seconds` (the same rule as a hit in the active run: coverage past the target and a retained
+    /// keyframe at or before it), and if one does, swaps it in: the active run is parked, the
+    /// consumer reads the parked one from that keyframe, and the source epoch moves so nothing the
+    /// producer has in flight lands in it. nil when no parked run holds the target (or its store
+    /// refused the cursor, purged by the system: that run is dropped and the seek is a miss).
+    private func resumeParkedRunLocked(_ token: UInt64, at seconds: Double) throws -> SeekPreparation? {
+        guard makeStore != nil, seconds.isFinite else { return nil }
+        condition.lock()
+        guard token == generation, !closed else { condition.unlock(); throw ReadError.interrupted }
+        var found: (index: Int, anchor: Keyframe)?
+        for index in parked.indices.reversed() {
+            let span = parked[index]
+            guard let end = frontier(at: seconds, video: span.videoCoverage, audio: span.audioCoverage,
+                                     presentation: span.presentationCoverage), end > seconds,
+                  let anchor = anchorLocked(in: span.keyframes, at: seconds) else { continue }
+            found = (index, anchor)
+            break
+        }
+        condition.unlock()
+        guard let (index, anchor) = found else { return nil }
+        let span = parked[index]
+        do {
+            try span.store.restore(to: anchor.cursor)
+        } catch SoftwarePacketDiskFIFO.Failure.invalidCursor {
+            dropParkedRun(at: index)
+            return nil
+        } catch SoftwarePacketDiskFIFO.Failure.retentionDisabled {
+            dropParkedRun(at: index)
+            return nil
+        }
+        let state = span.store.snapshot
+        condition.lock(); defer { condition.unlock() }
+        guard token == generation, !closed else { throw ReadError.interrupted }
+        parked.remove(at: index)
+        parkedResidentBytes -= span.residentBytes
+        swapActiveRunLocked(to: span.store)
+        // A packet the producer is reading for the run just left must not land in this one.
+        sourceEpoch &+= 1
+        resetPending = false
+        failure = nil; failureOrigin = .none
+        keyframes = span.keyframes
+        videoCoverage = span.videoCoverage
+        audioCoverage = span.audioCoverage
+        presentationCoverage = span.presentationCoverage
+        residency = span.residency
+        timingResidency = SoftwarePacketResidency()
+        storedVideoSeconds = span.storedVideoSeconds
+        storedTail = span.tail
+        ended = span.ended
+        copyDiskStateLocked(state)
+        sourceClock = seconds
+        consumedVideoSeconds = seconds
+        cacheSeekHits &+= 1
+        parkedRunHits &+= 1
+        let resume = span.ended ? nil : span.keyframes.last?.seconds
+        if let resume {
+            // The source still stands wherever the run just left had it. The producer stays parked
+            // until the host has moved it to this run's last keyframe; what it then reads up to the
+            // run's newest packet is already here.
+            sourceRepositioning = true
+            pendingSourceReposition = true
+            duplicatesBefore = span.tail
+        } else {
+            sourceRepositioning = false
+            pendingSourceReposition = false
+            duplicatesBefore = nil
+        }
+        condition.broadcast()
+        return .parkedHit(resumeSourceAt: resume)
+    }
+
+    /// Called with `operations` and `condition` held. Parks the active run (when it holds a
+    /// keyframe to seek to and nothing has failed; otherwise its store is closed) and makes `next`
+    /// the active store. The caller sets the active run's metadata for `next`.
+    private func swapActiveRunLocked(to next: any SoftwarePacketStore) {
+        let old = fifo
+        if failure == nil, !cacheTimingInvalid, !resetPending, old.retainsConsumedPackets, !keyframes.isEmpty {
+            old.park()
+            let resident = old.snapshot.residentByteCount
+            parked.append(Span(store: old, keyframes: keyframes, videoCoverage: videoCoverage,
+                               audioCoverage: audioCoverage, presentationCoverage: presentationCoverage,
+                               residency: residency, storedVideoSeconds: storedVideoSeconds, ended: ended,
+                               tail: storedTail, residentBytes: resident))
+            parkedResidentBytes += resident
+        } else {
+            DispatchQueue.global(qos: .utility).async { try? old.close() }
+        }
+        fifo = next
+        while parked.count > Self.maximumParkedRuns { dropParkedRunLocked(at: 0) }
+        // Parked runs share the session's byte budget with the active one: at least half of it
+        // stays for the run being played (a parked memory store holds none, its chunks are volatile).
+        while parkedResidentBytes > byteBudget / 2, !parked.isEmpty { dropParkedRunLocked(at: 0) }
+    }
+
+    private func dropParkedRun(at index: Int) {
+        condition.lock(); defer { condition.unlock() }
+        guard parked.indices.contains(index) else { return }
+        dropParkedRunLocked(at: index)
+    }
+
+    private func dropParkedRunLocked(at index: Int) {
+        let span = parked.remove(at: index)
+        parkedResidentBytes -= span.residentBytes
+        // Closing removes a disk store's files: never on the caller's thread.
+        DispatchQueue.global(qos: .utility).async { try? span.store.close() }
+    }
+
+    /// Whether a source move the host started for this epoch is still the current one.
+    func sourceEpochIsCurrent(_ epoch: UInt64) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        return epoch == sourceEpoch && !closed
+    }
+
+    var currentSourceEpoch: UInt64 {
+        condition.lock(); defer { condition.unlock() }
+        return sourceEpoch
+    }
+
+    /// The host moved the source for a resumed parked run (`.parkedHit`). On success the producer
+    /// carries on from there, dropping what the run already holds; on failure the run plays out
+    /// what it holds and then reports the error, as a source read failure does.
+    func finishSourceReposition(_ epoch: UInt64, landed: Bool) {
+        condition.lock(); defer { condition.unlock() }
+        guard epoch == sourceEpoch, !closed, pendingSourceReposition else { return }
+        pendingSourceReposition = false
+        if landed {
+            if !seeking { sourceRepositioning = false }
+        } else {
+            sourceRepositioning = false
+            duplicatesBefore = nil
+            failure = ReadError.sourceRepositionFailed
+            failureOrigin = .sourceRead
+        }
+        condition.broadcast()
     }
 
     /// AE#605: the retained video packets a scrub still at `seconds` needs, keyframe first, or nil
@@ -385,6 +628,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             && (frontierLocked(at: seconds).map { $0 > seconds } ?? false)
         let anchor = eligible
             ? keyframes.filter { $0.seconds <= seconds }.max { $0.seconds < $1.seconds } : nil
+        // The run can be parked under this walk: a parked store refuses or ends it, never misreads.
+        let store = fifo
         condition.unlock()
         guard let anchor, seconds - anchor.seconds <= maxSpanSeconds else { return nil }
 
@@ -393,7 +638,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         var tail = reorderTail
         var overflow = false
         do {
-            try fifo.readHistory(from: anchor.cursor) { data in
+            try store.readHistory(from: anchor.cursor) { data in
                 if isCancelled?() == true || (isCancelled != nil && ContinuousClock.now >= deadline) {
                     overflow = true; return false
                 }
@@ -424,7 +669,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         guard token == generation, !closed else { return }
         self.sourceClock = sourceClock
         seeking = false
-        sourceRepositioning = false
+        // A resumed parked run keeps the producer parked until the host has moved the source.
+        if !pendingSourceReposition { sourceRepositioning = false }
         condition.broadcast()
     }
 
@@ -438,9 +684,17 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         sourceEpoch &+= 1
         clearSourceMetadataLocked()
         let needsCleanup = !started
+        let store = fifo
+        let spans = needsCleanup ? parked : []
+        if needsCleanup { parked.removeAll(); parkedResidentBytes = 0 }
         condition.broadcast()
         condition.unlock()
-        if needsCleanup { DispatchQueue.global(qos: .utility).async { try? self.fifo.close() } }
+        if needsCleanup {
+            DispatchQueue.global(qos: .utility).async {
+                try? store.close()
+                for span in spans { try? span.store.close() }
+            }
+        }
     }
 
     /// Consumes one packet on the consumer thread; only source EOF returns nil.
@@ -526,7 +780,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         var packet = try SoftwareStoredPacket.decode(data)
         // Equality parks the producer too. Reclaim an eligible consumed chunk at the exact ceiling,
         // otherwise it can remain asleep with unread packets until the queue drains completely.
-        try fifo.trimConsumed(toByteBudget: max(0, byteBudget - 1))
+        condition.lock(); let activeBudget = max(1, byteBudget - parkedResidentBytes); condition.unlock()
+        try fifo.trimConsumed(toByteBudget: max(0, activeBudget - 1))
         let state = fifo.snapshot
         condition.lock()
         defer { condition.unlock() }
@@ -550,7 +805,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
 
     private func frontierLocked(at seconds: Double? = nil) -> Double? {
         guard !cacheTimingInvalid else { return nil }
-        let clock = seconds ?? sourceClock
+        return frontier(at: seconds ?? sourceClock, video: videoCoverage, audio: audioCoverage,
+                        presentation: presentationCoverage)
+    }
+
+    /// Where continuous coverage containing `clock` ends, for the active run or a parked one.
+    private func frontier(at clock: Double, video videoCoverage: SoftwarePacketCoverage,
+                          audio audioCoverage: SoftwareAudioPacketCoverage,
+                          presentation presentationCoverage: SoftwareVideoPacketCoverage?) -> Double? {
         let videoEnd: Double?
         if let presentationCoverage {
             videoEnd = presentationCoverage.frontierSeconds(containing: clock,
@@ -616,7 +878,11 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         // this epoch yet, and both entry reasons, cold start and a seek landing, have the consumer
         // waiting on the first packet it delivers.
         applyProducerQoS(QOS_CLASS_USER_INITIATED, reservoir: nil, waiting: 0)
-        defer { try? fifo.close() }
+        defer {
+            try? fifo.close()
+            condition.lock(); let spans = parked; parked.removeAll(); parkedResidentBytes = 0; condition.unlock()
+            for span in spans { try? span.store.close() }
+        }
         while true {
             condition.lock()
             while !closed && !resetPending && (sourceRepositioning || ended || failure != nil || shouldParkLocked()) {
@@ -671,6 +937,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                 condition.unlock()
                 return
             }
+            if dropsAsDuplicate(packet, token: token) { return }
             failureOrigin = .envelope
             let data = try packet.encoded()
             operations.lock()
@@ -679,9 +946,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             condition.unlock()
             if valid {
                 do {
-                    let recordReservation = min(byteBudget, data.count)
-                        + min(8, byteBudget - min(byteBudget, data.count))
-                    try fifo.trimConsumed(toByteBudget: byteBudget - recordReservation)
+                    condition.lock(); let activeBudget = max(1, byteBudget - parkedResidentBytes); condition.unlock()
+                    let recordReservation = min(activeBudget, data.count)
+                        + min(8, activeBudget - min(activeBudget, data.count))
+                    try fifo.trimConsumed(toByteBudget: activeBudget - recordReservation)
                     let cursor = try fifo.append(data)
                     let state = fifo.snapshot
                     if packet.streamIndex == video.index {
@@ -690,6 +958,9 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                     condition.lock()
                     if token == sourceEpoch, !closed, !sourceRepositioning {
                         copyDiskStateLocked(state)
+                        let mark = StoredTail.Mark(position: packet.position, dts: packet.dts, pts: packet.pts)
+                        if packet.streamIndex == video.index { storedTail.video = mark }
+                        else if packet.streamIndex == audio?.index { storedTail.audio = mark }
                         if forwardOnly {
                             if packet.streamIndex == video.index, let seconds = videoSeconds(pts: packet.pts) {
                                 storedVideoSeconds = seconds
@@ -735,6 +1006,24 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             }
             operations.unlock()
         } catch { recordFailure(error, token: token, origin: failureOrigin) }
+    }
+
+    /// After a resumed parked run's source move: drops what the run already holds, until both
+    /// streams have reached past its newest stored packet. Packets of other streams pass.
+    private func dropsAsDuplicate(_ packet: SoftwareStoredPacket, token: UInt64) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        guard token == sourceEpoch, var tail = duplicatesBefore else { return false }
+        let isVideo = packet.streamIndex == video.index
+        let isAudio = packet.streamIndex == audio?.index
+        guard isVideo || isAudio else { return false }
+        if let mark = isVideo ? tail.video : tail.audio {
+            if StoredTail.isDuplicate(position: packet.position, dts: packet.dts, pts: packet.pts, of: mark) {
+                return true
+            }
+            if isVideo { tail.video = nil } else { tail.audio = nil }
+            duplicatesBefore = tail.video == nil && tail.audio == nil ? nil : tail
+        }
+        return false
     }
 
     /// Only bounded metadata work under condition; parser and media I/O have already finished.
@@ -788,7 +1077,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         // Keep the unqualified GOP available to the decoder even when the source outruns it.
         // An empty reservoir always reads again: a very long GOP cannot deadlock qualification.
         if calibrationPressure { return true }
-        if residentBytes >= byteBudget { return true }
+        if residentBytes + parkedResidentBytes >= byteBudget { return true }
         // The forward limit is measured on the RESERVOIR, from the packet the consumer last took
         // to the newest one stored, because that is what the producer is actually building and it
         // is knowable from two timestamps. The coverage frontier answers a stricter question (is

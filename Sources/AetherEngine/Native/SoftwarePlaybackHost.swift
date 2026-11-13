@@ -143,6 +143,22 @@ final class SoftwarePlaybackHost {
         return (fifo, bytes, claim)
     }
 
+    /// An empty store of the same kind and bounds as `store`, for the read-ahead's next run: a seek
+    /// outside the run being played parks that run (`SoftwarePacketReadAhead`) and starts a new one.
+    nonisolated static func packetStoreFactory(like store: any SoftwarePacketStore, byteBudget: Int)
+        -> (@Sendable () throws -> any SoftwarePacketStore)? {
+        if let memory = store as? SoftwarePacketMemoryFIFO {
+            let history = memory.historyCapBytes
+            return { SoftwarePacketMemoryFIFO(historyCapBytes: history) }
+        }
+        if let disk = store as? SoftwarePacketDiskFIFO {
+            let parent = disk.storageDirectory.deletingLastPathComponent()
+            let chunk = min(4 << 20, max(8, byteBudget))
+            return { try SoftwarePacketDiskFIFO(chunkTargetBytes: chunk, retainConsumed: true, parentDirectory: parent) }
+        }
+        return nil
+    }
+
     // MARK: - Published state (mirrors NativeAVPlayerHost surface)
 
     /// Frames enqueued on the display layer; read by LiveTelemetrySampler at 1 Hz for observed FPS. Lock-guarded (demux thread writes, main-actor reads).
@@ -1682,7 +1698,8 @@ final class SoftwarePlaybackHost {
                     forwardSeconds: Double(segments) * 4,
                     initialSourceClock: initialSourceClock, fifo: fifo,
                     videoReorderDepth: videoReorderDepth, cacheTiming: cacheTiming,
-                    anchorsOnLastKeyframe: anchorsOnLastKeyframe
+                    anchorsOnLastKeyframe: anchorsOnLastKeyframe,
+                    makeStore: Self.packetStoreFactory(like: fifo, byteBudget: bytes)
                 ) { isCurrent in
                     guard let packet = try dem.readPacket(isCurrent: isCurrent) else { return nil }
                     defer { av_packet_unref(packet); av_packet_free_safe(packet) }
@@ -2490,16 +2507,29 @@ final class SoftwarePlaybackHost {
         var cacheHit = false
         if let packetSource, let cacheGeneration {
             let preparation = await BlockingWork.detached(priority: .userInitiated) {
-                try packetSource.prepareSeek(cacheGeneration, to: sourceSeconds)
+                let outcome = try packetSource.prepareSeekOutcome(cacheGeneration, to: sourceSeconds)
+                return (outcome, packetSource.currentSourceEpoch)
             }.result
+            // A parked run that took over needs its source move whatever happens to this seek: a
+            // newer seek that lands inside the same run moves nothing itself.
+            if case .success(let (.parkedHit(resume?), epoch)) = preparation {
+                resumeParkedRunSource(packetSource, dem, at: resume, epoch: epoch)
+            }
             guard seekGeneration == generation, !stopRequested else { return .superseded }
             switch preparation {
-            case .success(let hit):
-                cacheHit = hit
-                if !hit { residentRanges = [] }
+            case .success(let (outcome, _)):
+                let result: String
+                switch outcome {
+                case .hit: cacheHit = true; result = "hit"
+                case .parkedHit:
+                    cacheHit = true
+                    result = "parked-hit"
+                case .miss: result = "miss"
+                }
+                if !cacheHit { residentRanges = [] }
                 EngineLog.emit(
                     "[SWHost] packet cache seek generation=\(generation) "
-                    + "result=\(hit ? "hit" : "miss") "
+                    + "result=\(result) "
                     + "target_s=\(String(format: "%.3f", sourceSeconds)) "
                     + "resident_bytes=\(packetSource.snapshot.residentBytes)",
                     category: .swPlayback
@@ -2582,6 +2612,25 @@ final class SoftwarePlaybackHost {
         if let cacheGeneration { packetSource?.endSeek(cacheGeneration, sourceClock: sourceSeconds) }
         refreshSnapKeyframes()
         return outcome
+    }
+
+    /// A resumed parked run plays from what it holds while the source moves to the run's last
+    /// keyframe behind it, so the landing waits for no network. The move is the miss path's own,
+    /// on the same queue; it stands down only for a newer source move (a miss, or another parked
+    /// run), never for a seek that stays inside retained runs.
+    private func resumeParkedRunSource(_ packetSource: SoftwarePacketReadAhead, _ dem: Demuxer,
+                                       at seconds: Double, epoch: UInt64) {
+        let reposition = self.reposition
+        let queue = seekQueue
+        _ = BlockingWork.detached(priority: .userInitiated) {
+            let outcome = await reposition(dem, seconds, Self.seekBudgetSeconds, queue) {
+                !packetSource.sourceEpochIsCurrent(epoch)
+            }
+            EngineLog.emit("[SWHost] parked run source move to=\(String(format: "%.3f", seconds)) "
+                           + "outcome=\(outcome == .landed ? "landed" : outcome == .superseded ? "superseded" : "failed")",
+                           category: .swPlayback)
+            packetSource.finishSourceReposition(epoch, landed: outcome == .landed)
+        }
     }
 
     /// AE#595: the extractor, built on the first ask and kept for the rest of the session.

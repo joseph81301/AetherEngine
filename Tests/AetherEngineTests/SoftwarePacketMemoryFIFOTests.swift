@@ -124,6 +124,33 @@ struct SoftwarePacketMemoryFIFOTests {
         #expect(popped == record(90))
     }
 
+    @Test("a parked store holds nothing against the footprint and gives a cursor back, unread records included")
+    func parkAndRestore() throws {
+        let (fifo, cursors) = try filled(100)
+        for _ in 0..<20 { _ = try fifo.pop() }
+        fifo.park()
+        #expect(fifo.snapshot.diskByteCount == 0)
+        #expect(fifo.snapshot.count == 0)
+        #expect(try fifo.pop() == nil)
+        try fifo.restore(to: cursors[10])
+        #expect(fifo.snapshot.count == 90)
+        #expect(fifo.snapshot.diskByteCount >= 90 * 1008)
+        for i in 10..<100 { #expect(try fifo.pop() == record(i)) }
+        // Appending goes on after the restored run.
+        try fifo.append(record(100))
+        #expect(try fifo.pop() == record(100))
+    }
+
+    @Test("a parked store the kernel emptied refuses its cursor and stays parked")
+    func purgedParkedStore() throws {
+        let (fifo, cursors) = try filled(100, kernelMayPurge: true)
+        for _ in 0..<20 { _ = try fifo.pop() }
+        fifo.park()
+        fifo.purgeHistoryForTesting()
+        #expect(throws: SoftwarePacketDiskFIFO.Failure.invalidCursor) { try fifo.restore(to: cursors[50]) }
+        #expect(fifo.snapshot.diskByteCount == 0)
+    }
+
     @Test("reset invalidates old cursors and starts empty")
     func reset() throws {
         let (fifo, cursors) = try filled(50)
